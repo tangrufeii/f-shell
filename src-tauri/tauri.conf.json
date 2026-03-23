@@ -55,7 +55,7 @@
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDlCQTU2OTIzODgyQjY4MzEKUldReGFDdUlJMm1sbXd2bmZ1MUE4czd2QmdGL2pKR2NuekFBUFRzNXJCNXlYZFZISmd1dmY3aTEK",
       "endpoints": [
-        "https://example.com/fshell/latest.json"
+        "https://github.com/tangrufeii/f-shell/releases/latest/download/latest.json"
       ]
     }
   }
