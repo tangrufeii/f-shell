@@ -39,7 +39,7 @@ jobs:
         run: npm ci
 
       - name: Build and publish Tauri bundles
-        uses: tauri-apps/tauri-action@v1
+        uses: tauri-apps/tauri-action@action-v0.6.2
         with:
           tagName: v__VERSION__
           releaseName: FShell v__VERSION__
