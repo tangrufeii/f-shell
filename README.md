@@ -53,7 +53,7 @@ npm run tauri dev
 - [tauri.conf.json](/C:/Users/10427/Desktop/fshell/src-tauri/tauri.conf.json)
 - `https://github.com/tangrufeii/f-shell/releases/latest/download/latest.json`
 
-你现在只需要把 GitHub 仓库 Secret 配好，然后从 Actions 手动触发发布。
+你现在只需要把 GitHub 仓库 Secret 配好，然后按版本号打 tag 推上去，GitHub Actions 就会自动发布。
 
 1. 先在本地生成 updater 私钥
 
@@ -68,17 +68,26 @@ npx tauri signer generate -w .tauri/fshell-updater.key
 - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`
   如果你的私钥设置了密码就填；你现在这把无密码私钥可以先不填。
 
-3. 打开 GitHub `Actions` 页，运行工作流 `Release Desktop`
+3. 提交版本改动后，打上和版本号一致的 tag 并推送
 
 - 工作流文件在 [release.yml](/C:/Users/10427/Desktop/fshell/.github/workflows/release.yml)
-- 它会自动构建：
+- 例如当前版本是 `0.2.1`，就执行：
+
+```bash
+git tag v0.2.1
+git push origin main --tags
+```
+
+- 工作流会自动构建：
   - `NSIS setup.exe`
   - `MSI`
   - `.sig`
   - `latest.json`
 - 并自动上传到 GitHub Release
 
-4. 之后客户端点“检查更新”就会读取最新 Release 的 `latest.json`
+4. 如果你临时不想打 tag，仍然可以去 GitHub `Actions` 页手动运行 `Release Desktop`
+
+5. 之后客户端点“检查更新”就会读取最新 Release 的 `latest.json`
 
 ## 手动发布备用方案
 

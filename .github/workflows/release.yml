@@ -1,6 +1,9 @@
 name: Release Desktop
 
 on:
+  push:
+    tags:
+      - "v*"
   workflow_dispatch:
 
 permissions:
@@ -38,11 +41,28 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Read app version
+        id: app_version
+        shell: pwsh
+        run: |
+          $version = (Get-Content "package.json" | ConvertFrom-Json).version
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Validate pushed tag matches app version
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        run: |
+          $expectedTag = "v${{ steps.app_version.outputs.version }}"
+          $actualTag = "${{ github.ref_name }}"
+          if ($actualTag -ne $expectedTag) {
+            throw "Tag $actualTag does not match package version $expectedTag. Bump the app version first, then push the matching tag."
+          }
+
       - name: Build and publish Tauri bundles
         uses: tauri-apps/tauri-action@action-v0.6.2
         with:
-          tagName: v__VERSION__
-          releaseName: FShell v__VERSION__
+          tagName: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', steps.app_version.outputs.version) }}
+          releaseName: ${{ github.ref_type == 'tag' && format('FShell {0}', github.ref_name) || format('FShell v{0}', steps.app_version.outputs.version) }}
           releaseBody: |
             Automated Windows release for FShell.
 
