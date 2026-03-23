@@ -1,0 +1,62 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "FShell",
+  "version": "0.2.0",
+  "identifier": "com.laowang.fshell",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "FShell",
+        "width": 1560,
+        "height": 980,
+        "minWidth": 1260,
+        "minHeight": 780,
+        "transparent": true,
+        "decorations": false,
+        "resizable": true,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "createUpdaterArtifacts": true,
+    "icon": [
+      "icons/icon.ico",
+      "icons/icon.png",
+      "icons/icon-256.png",
+      "icons/icon-128.png",
+      "icons/icon-32.png"
+    ],
+    "windows": {
+      "nsis": {
+        "languages": [
+          "SimpChinese"
+        ],
+        "displayLanguageSelector": false
+      },
+      "wix": {
+        "language": "zh-CN"
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDlCQTU2OTIzODgyQjY4MzEKUldReGFDdUlJMm1sbXd2bmZ1MUE4czd2QmdGL2pKR2NuekFBUFRzNXJCNXlYZFZISmd1dmY3aTEK",
+      "endpoints": [
+        "https://example.com/fshell/latest.json"
+      ]
+    }
+  }
+}
