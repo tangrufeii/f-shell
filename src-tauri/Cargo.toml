@@ -1,8 +1,8 @@
 [package]
 name = "fshell"
-version = "0.2.0"
+version = "0.2.1"
 description = "A modern Rust shell workspace"
-authors = ["Codex"]
+authors = ["唐如飞"]
 edition = "2021"
 rust-version = "1.86"
 

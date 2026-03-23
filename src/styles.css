@@ -521,6 +521,10 @@ textarea {
   width: min(460px, 100%);
 }
 
+.about-dialog {
+  width: min(680px, 100%);
+}
+
 .glass-panel {
   background: var(--panel-bg);
   border: 1px solid var(--panel-border);
@@ -764,6 +768,16 @@ h3 {
   border: 1px solid rgba(255, 148, 168, 0.26);
 }
 
+.about-alert {
+  background: rgba(72, 198, 255, 0.14);
+  border: 1px solid rgba(110, 212, 255, 0.22);
+}
+
+.update-alert {
+  background: rgba(255, 198, 66, 0.18);
+  border: 1px solid rgba(255, 216, 124, 0.24);
+}
+
 .primary-button,
 .ghost-button,
 .crumb,
@@ -847,6 +861,11 @@ h3 {
   color: #f4fbff;
 }
 
+.about-pill-highlight {
+  background: rgba(255, 198, 66, 0.22);
+  color: #fff6d3;
+}
+
 .terminal-status.live {
   background: rgba(74, 222, 128, 0.24);
   color: #f5fff8;
@@ -880,6 +899,42 @@ h3 {
   line-height: 1.2;
 }
 
+.about-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.about-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  padding: 14px 16px;
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.12);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+}
+
+.about-card span,
+.about-link-row > span {
+  color: var(--text-soft);
+  font-size: 12px;
+}
+
+.about-card strong {
+  font-size: 18px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.about-card small {
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
 .list-block {
   display: flex;
   flex-direction: column;
@@ -911,6 +966,49 @@ h3 {
 
 .path-chip.subtle {
   background: rgba(255, 255, 255, 0.1);
+}
+
+.about-link-list {
+  gap: 12px;
+}
+
+.about-link-row {
+  display: grid;
+  gap: 8px;
+}
+
+.about-link-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.about-link-actions .path-chip {
+  flex: 1 1 auto;
+  justify-content: flex-start;
+}
+
+.about-notes-block {
+  display: grid;
+  gap: 10px;
+}
+
+.compact-title {
+  justify-content: flex-start;
+}
+
+.about-notes {
+  min-height: 96px;
+  padding: 14px 16px;
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.1);
+  color: rgba(248, 251, 255, 0.92);
+  line-height: 1.65;
+}
+
+.about-action-row {
+  align-items: stretch;
 }
 
 .main-panel {
@@ -1655,6 +1753,16 @@ h3 {
 
   .stat-grid {
     grid-template-columns: 1fr;
+  }
+
+  .about-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .about-link-actions,
+  .about-action-row {
+    flex-direction: column;
+    align-items: stretch;
   }
 
   .terminal-host {

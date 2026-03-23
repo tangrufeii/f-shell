@@ -54,6 +54,8 @@ type FileActionDialogState = {
 
 const COMMAND_HISTORY_STORAGE_KEY = "fshell-command-history";
 const COMMAND_HISTORY_LIMIT = 40;
+const GITHUB_RELEASES_PAGE_URL = "https://github.com/tangrufeii/f-shell/releases";
+const GITHUB_LATEST_JSON_URL = `${GITHUB_RELEASES_PAGE_URL}/latest/download/latest.json`;
 const WINDOW_RESIZE_DIRECTIONS: ResizeDirection[] = [
   "North",
   "South",
@@ -110,6 +112,25 @@ function formatModifiedAt(timestamp: number | null): string {
     hour: "2-digit",
     minute: "2-digit"
   }).format(new Date(timestamp * 1000));
+}
+
+function formatUpdatePubDate(value: string | null): string {
+  if (!value) {
+    return "时间未知";
+  }
+
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return value;
+  }
+
+  return new Intl.DateTimeFormat("zh-CN", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit"
+  }).format(parsed);
 }
 
 function formatPermissions(permissions: number | null): string {
@@ -625,6 +646,7 @@ function App() {
   const [dragTargetPath, setDragTargetPath] = useState("");
   const [activeWorkspace, setActiveWorkspace] = useState<"terminal" | "preview">("terminal");
   const [isConnectModalOpen, setIsConnectModalOpen] = useState(false);
+  const [isAboutDialogOpen, setIsAboutDialogOpen] = useState(false);
   const [isWindowMaximized, setIsWindowMaximized] = useState(false);
   const [isWindowFullscreen, setIsWindowFullscreen] = useState(false);
   const [appVersion, setAppVersion] = useState("");
@@ -728,6 +750,7 @@ function App() {
       if (event.key === "Escape") {
         setTreeContextMenu(null);
         setFileActionDialog(null);
+        setIsAboutDialogOpen(false);
       }
     };
 
@@ -745,6 +768,14 @@ function App() {
       window.removeEventListener("scroll", closeMenu, true);
     };
   }, []);
+
+  useEffect(() => {
+    if (!isAboutDialogOpen || updateInfo || isCheckingUpdate) {
+      return;
+    }
+
+    void checkAppUpdate();
+  }, [isAboutDialogOpen, isCheckingUpdate, updateInfo]);
 
   useEffect(() => {
     if (activeWorkspace !== "terminal") {
@@ -1480,6 +1511,14 @@ function App() {
     }
   }
 
+  function openAboutDialog() {
+    setIsAboutDialogOpen(true);
+  }
+
+  function closeAboutDialog() {
+    setIsAboutDialogOpen(false);
+  }
+
   async function startWindowDragging(event: ReactMouseEvent<HTMLElement>) {
     if (event.button !== 0 || isWindowFullscreen || isWindowDragBlockedTarget(event.target)) {
       return;
@@ -2015,16 +2054,25 @@ function App() {
   const basicLatencyLabel = connection ? `${connection.latencyMs}ms` : "--";
   const terminalStatusLabel = connection ? "终端在线" : "终端离线";
   const versionLabel = appVersion ? `v${appVersion}` : "版本读取中";
-  const updateButtonLabel = isInstallingUpdate
-    ? "更新中..."
-    : isCheckingUpdate
-      ? "检查中..."
-      : updateInfo?.available && updateInfo.version
-        ? `升级 ${updateInfo.version}`
-        : "检查更新";
+  const updateButtonLabel = updateInfo?.available && updateInfo.version ? `有新版本 ${updateInfo.version}` : "关于 / 更新";
   const updateButtonTitle = updateInfo?.available
     ? [updateInfo.message, updateInfo.notes].filter(Boolean).join("\n\n")
     : `当前版本 ${appVersion || "--"}`;
+  const releasePageUrl = updateInfo?.version
+    ? `${GITHUB_RELEASES_PAGE_URL}/tag/v${updateInfo.version}`
+    : GITHUB_RELEASES_PAGE_URL;
+  const updateStatusLabel = updateInfo
+    ? updateInfo.available
+      ? `发现新版本 ${updateInfo.version}`
+      : "当前已是最新版本"
+    : "尚未检查更新";
+  const aboutPrimaryLabel = isInstallingUpdate
+    ? "安装更新中..."
+    : isCheckingUpdate
+      ? "检查更新中..."
+      : updateInfo?.available && updateInfo.version
+        ? `安装 ${updateInfo.version}`
+        : "检查更新";
   const currentEntries = currentPath ? entriesByPath[currentPath] ?? [] : entriesByPath["/"] ?? [];
   const currentDirCount = currentEntries.filter((entry) => entry.isDir).length;
   const currentFileCount = currentEntries.filter((entry) => !entry.isDir).length;
@@ -2137,8 +2185,7 @@ function App() {
           </button>
           <button
             className={`ghost-button small update-button ${updateInfo?.available ? "update-ready" : ""}`}
-            disabled={isCheckingUpdate || isInstallingUpdate}
-            onClick={() => void (updateInfo?.available ? installAppUpdate() : checkAppUpdate())}
+            onClick={() => openAboutDialog()}
             title={updateButtonTitle}
           >
             {updateButtonLabel}
@@ -2654,6 +2701,106 @@ function App() {
                 onClick={() => closeFileActionDialog()}
               >
                 取消
+              </button>
+            </div>
+          </section>
+        </div>
+      ) : null}
+
+      {isAboutDialogOpen ? (
+        <div className="modal-backdrop">
+          <section className="glass-panel connect-dialog about-dialog" onClick={(event) => event.stopPropagation()}>
+            <div className="section-title">
+              <div>
+                <p className="eyebrow">Product</p>
+                <h2>关于 / 更新</h2>
+              </div>
+              <span className={`status-pill ${updateInfo?.available ? "about-pill-highlight" : "live"}`}>
+                {updateStatusLabel}
+              </span>
+            </div>
+
+            {updateInfo?.available ? (
+              <div className="form-alert update-alert">
+                <strong>发现可安装更新</strong>
+                <span>{updateInfo.message}</span>
+              </div>
+            ) : (
+              <div className="form-alert about-alert">
+                <strong>当前版本信息</strong>
+                <span>{updateInfo?.message ?? "还没查过更新，点下面按钮就会去 GitHub Releases 拉最新状态。"}</span>
+              </div>
+            )}
+
+            <div className="about-grid">
+              <div className="about-card">
+                <span>当前版本</span>
+                <strong>{appVersion || "--"}</strong>
+                <small>当前运行中的桌面版本</small>
+              </div>
+              <div className="about-card">
+                <span>最新版本</span>
+                <strong>{updateInfo?.version ?? appVersion ?? "--"}</strong>
+                <small>{updateInfo?.available ? "GitHub Releases 已发现更新" : "已同步到最新发布状态"}</small>
+              </div>
+              <div className="about-card">
+                <span>发布时间</span>
+                <strong>{formatUpdatePubDate(updateInfo?.pubDate ?? null)}</strong>
+                <small>来自 updater 返回的发布时间</small>
+              </div>
+              <div className="about-card">
+                <span>更新源</span>
+                <strong>GitHub Releases</strong>
+                <small>latest.json + installer signatures</small>
+              </div>
+            </div>
+
+            <div className="list-block about-link-list">
+              <div className="about-link-row">
+                <span>Release 页面</span>
+                <div className="about-link-actions">
+                  <div className="path-chip subtle">{releasePageUrl}</div>
+                  <button className="ghost-button small" onClick={() => void copyTextToClipboard(releasePageUrl, "Release 链接")}>
+                    复制
+                  </button>
+                </div>
+              </div>
+              <div className="about-link-row">
+                <span>latest.json</span>
+                <div className="about-link-actions">
+                  <div className="path-chip subtle">{GITHUB_LATEST_JSON_URL}</div>
+                  <button className="ghost-button small" onClick={() => void copyTextToClipboard(GITHUB_LATEST_JSON_URL, "更新源地址")}>
+                    复制
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <div className="about-notes-block">
+              <div className="section-title compact-title">
+                <div>
+                  <p className="eyebrow">Release Notes</p>
+                  <h3>{updateInfo?.version ? `v${updateInfo.version}` : "尚未获取更新说明"}</h3>
+                </div>
+              </div>
+              <div className="about-notes">
+                <p>{updateInfo?.notes?.trim() || "当前没有额外的更新说明。你也可以直接去 GitHub Release 页面查看完整产物和标签。"}</p>
+              </div>
+            </div>
+
+            <div className="action-row about-action-row">
+              <button
+                className="primary-button"
+                disabled={isCheckingUpdate || isInstallingUpdate}
+                onClick={() => void (updateInfo?.available ? installAppUpdate() : checkAppUpdate())}
+              >
+                {aboutPrimaryLabel}
+              </button>
+              <button className="ghost-button" onClick={() => void copyTextToClipboard(appVersion || "--", "版本号")}>
+                复制版本号
+              </button>
+              <button className="ghost-button" onClick={() => closeAboutDialog()}>
+                关闭
               </button>
             </div>
           </section>
