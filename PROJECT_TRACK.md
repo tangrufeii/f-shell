@@ -1,6 +1,6 @@
 # FShell 项目追踪
 
-最后更新：2026-03-20
+最后更新：2026-03-23
 
 ## 项目目标
 
@@ -67,6 +67,8 @@
 - 已启用 updater 签名产物生成
 - 已把 Windows NSIS / MSI 打包语言切到中文
 - 已修复 Windows 发布版额外弹出控制台窗口的问题
+- 已把 updater 更新源改成 GitHub Releases `latest.json`
+- 已新增 GitHub Actions Windows 发版工作流
 
 ## 今日新增
 
@@ -93,6 +95,9 @@
 - NSIS 安装器语言切到 `SimpChinese`
 - WiX / MSI 语言切到 `zh-CN`
 - 发布版主进程切到 Windows GUI 子系统，去掉额外黑框
+- updater 端点切到 GitHub Releases 的 `releases/latest/download/latest.json`
+- 新增 `.github/workflows/release.yml`，手动触发即可自动发布 Windows 安装包和 updater 资产
+- 已确认当前机器可通过猫猫云 `127.0.0.1:7890` 代理推送 GitHub 仓库
 
 ## 当前已知问题 / 待打磨
 
@@ -102,7 +107,8 @@
 - 预览区仍缺少更强的格式化预览能力
 - 连接错误提示已经有了，但文案还可以更“桌面工具化”
 - 实时主机指标（CPU、内存、负载）仍未接入
-- 更新源地址目前仍是占位值，需要替换成你自己的 HTTPS `latest.json` 地址后，在线更新才会真正对外可用
+- GitHub Actions 还没真正跑过首个线上 Release
+- 仓库还没配置 `TAURI_SIGNING_PRIVATE_KEY` Secret，Actions 发布前必须先补
 
 ## 下一步建议
 
@@ -118,8 +124,8 @@
 - 优化连接错误文案
 - 对 DNS 失败、端口拒绝、认证失败、超时做更明确的人话提示
 - 为连接配置增加最近连接 / 快速复用
-- 把 updater 占位更新源替换成正式发布地址
-- 把签名私钥迁到 CI Secret，不要继续放本地工作目录
+- 跑通首个 GitHub Actions Release
+- 把签名私钥迁到 GitHub Actions Secret，后续别继续依赖本地私钥文件
 
 ### P2
 

@@ -10,6 +10,7 @@
 - 已按透明毛玻璃方向重做主工作台 UI
 - 已补产品级应用图标资产，替换占位任务栏图标
 - 已接入 Tauri 2 在线更新客户端链路和更新产物生成
+- 已接入 GitHub Releases 自动发版工作流
 - 当前仍待补：多连接管理、密钥认证、图片/PDF 专用预览器
 
 ## 目录结构
@@ -36,7 +37,7 @@
 4. 会话增强
    补标签页、分屏、重连、保活、主题切换和终端配置。
 5. 在线更新
-   现在客户端已经接好了，但 `src-tauri/tauri.conf.json` 里的 `plugins.updater.endpoints` 还是占位地址。你得把安装包、`.sig` 和 `latest.json` 发布到你自己的 HTTPS 地址，应用内检查更新才会真的生效。
+   客户端已经指向 GitHub Releases 的 `latest.json` 端点，配好仓库 Secrets 并跑一次 GitHub Actions 发布后，应用内检查更新就能真正生效。
 
 ## 启动
 
@@ -45,33 +46,45 @@ npm install
 npm run tauri dev
 ```
 
-## 在线更新发布
+## GitHub 发布与在线更新
 
-1. 生成签名私钥和公钥
+当前仓库已经把 updater 端点指向 GitHub Releases：
+
+- [tauri.conf.json](/C:/Users/10427/Desktop/fshell/src-tauri/tauri.conf.json)
+- `https://github.com/tangrufeii/f-shell/releases/latest/download/latest.json`
+
+你现在只需要把 GitHub 仓库 Secret 配好，然后从 Actions 手动触发发布。
+
+1. 先在本地生成 updater 私钥
 
 ```bash
 npx tauri signer generate -w .tauri/fshell-updater.key
 ```
 
-2. 构建带更新签名的安装包
+2. 打开仓库 `Settings -> Secrets and variables -> Actions`，新增这些 Secrets
 
-```powershell
-$env:TAURI_SIGNING_PRIVATE_KEY_PATH=".tauri/fshell-updater.key"
-npx tauri build --bundles nsis --ci
-```
+- `TAURI_SIGNING_PRIVATE_KEY`
+  这里填 `.tauri/fshell-updater.key` 的完整文本内容，不是文件路径。
+- `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`
+  如果你的私钥设置了密码就填；你现在这把无密码私钥可以先不填。
 
-3. 生成 `latest.json`
+3. 打开 GitHub `Actions` 页，运行工作流 `Release Desktop`
 
-```powershell
-.\tools\generate-update-manifest.ps1 -BaseUrl "https://your-download-host/fshell" -OutputPath "latest.json"
-```
+- 工作流文件在 [release.yml](/C:/Users/10427/Desktop/fshell/.github/workflows/release.yml)
+- 它会自动构建：
+  - `NSIS setup.exe`
+  - `MSI`
+  - `.sig`
+  - `latest.json`
+- 并自动上传到 GitHub Release
 
-4. 把下面三样发布到同一个 HTTPS 目录
-   `FShell_xxx-setup.exe`
-   `FShell_xxx-setup.exe.sig`
-   `latest.json`
+4. 之后客户端点“检查更新”就会读取最新 Release 的 `latest.json`
 
-5. 把 [src-tauri/tauri.conf.json](C:\Users\10427\Desktop\fshell\src-tauri\tauri.conf.json) 里的 `plugins.updater.endpoints` 改成你自己的 `latest.json` 地址，再重新打包。
+## 手动发布备用方案
+
+如果你不想走 GitHub Actions，仓库里仍然保留了本地手动生成 `latest.json` 的脚本：
+
+- [generate-update-manifest.ps1](/C:/Users/10427/Desktop/fshell/tools/generate-update-manifest.ps1)
 
 ## Windows 打包语言
 

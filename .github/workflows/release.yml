@@ -1,0 +1,59 @@
+name: Release Desktop
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release-windows:
+    name: Build Windows Release
+    runs-on: windows-latest
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify updater signing secret
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) {
+            throw "Missing repository secret TAURI_SIGNING_PRIVATE_KEY. Put the full private key content into GitHub Secrets before publishing."
+          }
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build and publish Tauri bundles
+        uses: tauri-apps/tauri-action@v1
+        with:
+          tagName: v__VERSION__
+          releaseName: FShell v__VERSION__
+          releaseBody: |
+            Automated Windows release for FShell.
+
+            Included assets:
+            - NSIS installer
+            - MSI installer
+            - updater signatures
+            - latest.json for Tauri updater
+          releaseDraft: false
+          prerelease: false
+          args: --bundles nsis msi
+          uploadUpdaterJson: true
+          updaterJsonPreferNsis: true
+          uploadUpdaterSignatures: true
