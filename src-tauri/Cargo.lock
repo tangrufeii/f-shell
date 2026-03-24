@@ -1113,7 +1113,7 @@ dependencies = [
 
 [[package]]
 name = "fshell"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "base64 0.22.1",
  "rfd",
@@ -1123,6 +1123,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-updater",
+ "url",
 ]
 
 [[package]]

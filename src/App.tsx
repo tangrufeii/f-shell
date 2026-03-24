@@ -1658,13 +1658,17 @@ function App() {
     const reason = options?.reason ?? "manual";
     const startedAt = window.performance.now();
     setIsCheckingUpdate(true);
-    setStatusLine(reason === "startup" ? "正在后台检查更新..." : "正在检查更新...");
+    if (reason === "manual") {
+      setStatusLine("正在检查更新...");
+    }
     try {
       const result = await invoke<AppUpdateInfo>("check_app_update");
       setUpdateCheckDurationMs(window.performance.now() - startedAt);
       setUpdateInfo(result);
       setAppVersion(result.currentVersion);
-      setStatusLine(result.message);
+      if (reason === "manual") {
+        setStatusLine(result.message);
+      }
       if (result.available && result.version) {
         setUpdateProgress(null);
         openUpdateNotice(result, reason);
@@ -1686,7 +1690,9 @@ function App() {
       console.error(error);
       const message = `检查更新失败: ${String(error)}`;
       setUpdateCheckDurationMs(window.performance.now() - startedAt);
-      setStatusLine(message);
+      if (reason === "manual") {
+        setStatusLine(message);
+      }
       if (reason !== "startup") {
         setUpdateNotice({
           kind: "error",

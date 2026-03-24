@@ -1,4 +1,5 @@
 use std::{
+    env,
     fs,
     io::{ErrorKind, Read, Write},
     net::TcpStream,
@@ -14,6 +15,7 @@ use ssh2::{FileStat, OpenFlags, OpenType, Session};
 use tauri::{AppHandle, Emitter, State};
 #[cfg(desktop)]
 use tauri_plugin_updater::UpdaterExt;
+use url::Url;
 
 use crate::{
     models::{
@@ -32,7 +34,7 @@ pub async fn check_app_update(app: AppHandle) -> Result<AppUpdateInfo, String> {
     #[cfg(desktop)]
     {
         let current_version = app.package_info().version.to_string();
-        let updater = app.updater().map_err(humanize_updater_error)?;
+        let updater = build_updater(&app)?;
         let update = updater.check().await.map_err(humanize_updater_error)?;
 
         if let Some(update) = update {
@@ -79,7 +81,7 @@ pub async fn install_app_update(app: AppHandle) -> Result<AppUpdateInstallRespon
                 progress_percent: Some(0.0),
             },
         );
-        let updater = app.updater().map_err(humanize_updater_error)?;
+        let updater = build_updater(&app)?;
         let update = updater.check().await.map_err(humanize_updater_error)?;
         let Some(update) = update else {
             let current_version = app.package_info().version.to_string();
@@ -1295,8 +1297,13 @@ fn humanize_updater_error(error: impl std::fmt::Display) -> String {
         || lower.contains("dns")
         || lower.contains("connection")
         || lower.contains("network")
+        || lower.contains("sending request")
+        || lower.contains("tls handshake eof")
+        || lower.contains("connection was reset")
     {
-        return format!("更新源连不上，先检查网络和更新地址。原始错误：{raw}");
+        return format!(
+            "更新源连不上。当前默认直连 GitHub Releases，在中国网络环境下经常会失败。先检查代理是否生效，或者给应用配置本地代理后再试。原始错误：{raw}"
+        );
     }
 
     raw
@@ -1304,6 +1311,103 @@ fn humanize_updater_error(error: impl std::fmt::Display) -> String {
 
 fn emit_update_progress(app: &AppHandle, payload: AppUpdateProgress) {
     let _ = app.emit("update-progress", payload);
+}
+
+#[cfg(desktop)]
+fn build_updater(app: &AppHandle) -> Result<tauri_plugin_updater::Updater, String> {
+    let mut builder = app.updater_builder().timeout(Duration::from_secs(18));
+    if let Some(proxy) = resolve_updater_proxy() {
+        builder = builder.proxy(proxy);
+    }
+    builder.build().map_err(humanize_updater_error)
+}
+
+#[cfg(desktop)]
+fn resolve_updater_proxy() -> Option<Url> {
+    let env_candidates = [
+        "FSHELL_UPDATER_PROXY",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ];
+
+    for key in env_candidates {
+        if let Some(value) = env::var_os(key).and_then(|value| value.into_string().ok()) {
+            if let Some(proxy) = normalize_proxy_url(&value) {
+                return Some(proxy);
+            }
+        }
+    }
+
+    if let Some(port) = read_maomaocloud_mixed_port() {
+        let candidate = format!("http://127.0.0.1:{port}");
+        if let Some(proxy) = proxy_if_reachable(&candidate) {
+            return Some(proxy);
+        }
+    }
+
+    for candidate in [
+        "http://127.0.0.1:10090",
+        "http://127.0.0.1:7890",
+        "http://127.0.0.1:7891",
+        "http://127.0.0.1:10809",
+    ] {
+        if let Some(proxy) = proxy_if_reachable(candidate) {
+            return Some(proxy);
+        }
+    }
+
+    None
+}
+
+#[cfg(desktop)]
+fn read_maomaocloud_mixed_port() -> Option<u16> {
+    let user_profile = env::var_os("USERPROFILE")?;
+    let config_path = PathBuf::from(user_profile)
+        .join(".config")
+        .join("MAOMAOCLOUD")
+        .join("config.yaml");
+    let content = fs::read_to_string(config_path).ok()?;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if let Some(value) = trimmed.strip_prefix("mixed-port:") {
+            let value = value.trim().trim_matches('\'').trim_matches('"');
+            if let Ok(port) = value.parse::<u16>() {
+                return Some(port);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(desktop)]
+fn proxy_if_reachable(raw: &str) -> Option<Url> {
+    let url = normalize_proxy_url(raw)?;
+    let host = url.host_str()?;
+    let port = url.port_or_known_default()?;
+    let address = format!("{host}:{port}");
+    let socket = address.parse().ok()?;
+    if TcpStream::connect_timeout(&socket, Duration::from_millis(280)).is_ok() {
+        return Some(url);
+    }
+    None
+}
+
+#[cfg(desktop)]
+fn normalize_proxy_url(raw: &str) -> Option<Url> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Ok(url) = Url::parse(trimmed) {
+        return Some(url);
+    }
+
+    Url::parse(&format!("http://{trimmed}")).ok()
 }
 
 fn explain_remote_write_error(
