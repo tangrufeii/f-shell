@@ -17,9 +17,9 @@ use tauri_plugin_updater::UpdaterExt;
 
 use crate::{
     models::{
-        AppUpdateInfo, AppUpdateInstallResponse, ConnectRequest, ConnectionSummary, DownloadResponse,
-        FileActionResponse, FilePreview, RemoteEntry, SaveResponse, ShellOverview, TerminalChunk,
-        TerminalStatus, UploadResponse,
+        AppUpdateInfo, AppUpdateInstallResponse, AppUpdateProgress, ConnectRequest,
+        ConnectionSummary, DownloadResponse, FileActionResponse, FilePreview, RemoteEntry,
+        SaveResponse, ShellOverview, TerminalChunk, TerminalStatus, UploadResponse,
     },
     state::{AppState, StoredConnection, TerminalCommand, TerminalHandle},
 };
@@ -68,10 +68,32 @@ pub async fn check_app_update(app: AppHandle) -> Result<AppUpdateInfo, String> {
 pub async fn install_app_update(app: AppHandle) -> Result<AppUpdateInstallResponse, String> {
     #[cfg(desktop)]
     {
+        emit_update_progress(
+            &app,
+            AppUpdateProgress {
+                stage: "preparing".into(),
+                message: "正在确认远端更新信息...".into(),
+                version: None,
+                downloaded_bytes: Some(0),
+                total_bytes: None,
+                progress_percent: Some(0.0),
+            },
+        );
         let updater = app.updater().map_err(humanize_updater_error)?;
         let update = updater.check().await.map_err(humanize_updater_error)?;
         let Some(update) = update else {
             let current_version = app.package_info().version.to_string();
+            emit_update_progress(
+                &app,
+                AppUpdateProgress {
+                    stage: "idle".into(),
+                    message: format!("当前已经是最新版本 {current_version}。"),
+                    version: Some(current_version.clone()),
+                    downloaded_bytes: Some(0),
+                    total_bytes: Some(0),
+                    progress_percent: Some(100.0),
+                },
+            );
             return Ok(AppUpdateInstallResponse {
                 version: current_version.clone(),
                 message: format!("当前已经是最新版本 {current_version}，不用重复安装。"),
@@ -79,14 +101,79 @@ pub async fn install_app_update(app: AppHandle) -> Result<AppUpdateInstallRespon
         };
 
         let target_version = update.version.clone();
+        let download_app = app.clone();
+        let install_app = app.clone();
+        let downloading_version = target_version.clone();
+        let installing_version = target_version.clone();
+        emit_update_progress(
+            &app,
+            AppUpdateProgress {
+                stage: "downloading".into(),
+                message: format!("开始下载更新 {target_version} ..."),
+                version: Some(target_version.clone()),
+                downloaded_bytes: Some(0),
+                total_bytes: None,
+                progress_percent: Some(0.0),
+            },
+        );
         update
             .download_and_install(
-                |_chunk_length, _content_length| {},
-                || {},
+                move |downloaded_bytes, total_bytes| {
+                    let downloaded_bytes = downloaded_bytes as u64;
+                    let progress_percent = total_bytes.and_then(|total| {
+                        if total > 0 {
+                            Some((downloaded_bytes as f64 / total as f64) * 100.0)
+                        } else {
+                            None
+                        }
+                    });
+                    let message = if let Some(total) = total_bytes {
+                        format!(
+                            "正在下载更新 {downloading_version} · {downloaded_bytes}/{total} bytes"
+                        )
+                    } else {
+                        format!("正在下载更新 {downloading_version} ...")
+                    };
+                    emit_update_progress(
+                        &download_app,
+                        AppUpdateProgress {
+                            stage: "downloading".into(),
+                            message,
+                            version: Some(downloading_version.clone()),
+                            downloaded_bytes: Some(downloaded_bytes),
+                            total_bytes,
+                            progress_percent,
+                        },
+                    );
+                },
+                move || {
+                    emit_update_progress(
+                        &install_app,
+                        AppUpdateProgress {
+                            stage: "installing".into(),
+                            message: format!("下载完成，正在安装 {installing_version} ..."),
+                            version: Some(installing_version.clone()),
+                            downloaded_bytes: None,
+                            total_bytes: None,
+                            progress_percent: Some(100.0),
+                        },
+                    );
+                },
             )
             .await
             .map_err(humanize_updater_error)?;
 
+        emit_update_progress(
+            &app,
+            AppUpdateProgress {
+                stage: "completed".into(),
+                message: format!("更新 {target_version} 已安装，应用准备重启。"),
+                version: Some(target_version.clone()),
+                downloaded_bytes: None,
+                total_bytes: None,
+                progress_percent: Some(100.0),
+            },
+        );
         app.request_restart();
 
         return Ok(AppUpdateInstallResponse {
@@ -1213,6 +1300,10 @@ fn humanize_updater_error(error: impl std::fmt::Display) -> String {
     }
 
     raw
+}
+
+fn emit_update_progress(app: &AppHandle, payload: AppUpdateProgress) {
+    let _ = app.emit("update-progress", payload);
 }
 
 fn explain_remote_write_error(

@@ -87,6 +87,15 @@ export interface AppUpdateInstallResponse {
   message: string;
 }
 
+export interface AppUpdateProgress {
+  stage: string;
+  message: string;
+  version: string | null;
+  downloadedBytes: number | null;
+  totalBytes: number | null;
+  progressPercent: number | null;
+}
+
 export interface TerminalChunk {
   data: string;
 }

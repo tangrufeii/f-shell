@@ -64,6 +64,149 @@ textarea {
   overflow: hidden;
 }
 
+.update-notice {
+  position: fixed;
+  top: 82px;
+  right: 22px;
+  z-index: 8;
+  display: grid;
+  gap: 14px;
+  width: min(420px, calc(100vw - 44px));
+  padding: 16px 18px;
+  border-radius: 24px;
+  background: rgba(14, 22, 40, 0.34);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  box-shadow: 0 28px 64px rgba(21, 16, 49, 0.28);
+  backdrop-filter: blur(32px) saturate(136%);
+  -webkit-backdrop-filter: blur(32px) saturate(136%);
+}
+
+.update-notice.info {
+  border-color: rgba(102, 204, 255, 0.28);
+}
+
+.update-notice.success {
+  border-color: rgba(105, 232, 161, 0.28);
+}
+
+.update-notice.warning {
+  border-color: rgba(255, 218, 118, 0.3);
+}
+
+.update-notice.error {
+  border-color: rgba(255, 136, 158, 0.3);
+}
+
+.update-notice-head,
+.update-progress-meta,
+.update-notice-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.update-notice-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 72px;
+  height: 28px;
+  padding: 0 12px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.12);
+  color: rgba(248, 251, 255, 0.88);
+  font-size: 12px;
+}
+
+.update-notice-badge.info {
+  background: rgba(72, 198, 255, 0.18);
+}
+
+.update-notice-badge.success {
+  background: rgba(74, 222, 128, 0.18);
+}
+
+.update-notice-badge.warning {
+  background: rgba(255, 198, 66, 0.2);
+}
+
+.update-notice-badge.error {
+  background: rgba(255, 92, 120, 0.18);
+}
+
+.update-notice-close {
+  flex: 0 0 auto;
+}
+
+.update-notice-copy {
+  display: grid;
+  gap: 6px;
+}
+
+.update-notice-copy strong {
+  font-size: 18px;
+  line-height: 1.2;
+}
+
+.update-notice-copy p,
+.update-notice-copy small {
+  margin: 0;
+  line-height: 1.55;
+}
+
+.update-notice-copy p {
+  color: rgba(248, 251, 255, 0.92);
+  font-size: 14px;
+}
+
+.update-notice-copy small {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.update-progress-block,
+.about-progress-block {
+  display: grid;
+  gap: 10px;
+  padding: 12px 14px;
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.1);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+}
+
+.update-progress-meta span {
+  color: rgba(248, 251, 255, 0.86);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.update-progress-meta strong {
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.update-progress-track {
+  width: 100%;
+  height: 8px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.update-progress-fill {
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #67d3ff 0%, #2f7cff 52%, #ffd16e 100%);
+  box-shadow: 0 0 18px rgba(100, 180, 255, 0.38);
+  transition: width 220ms ease;
+}
+
+.update-notice-actions {
+  justify-content: flex-start;
+  flex-wrap: wrap;
+}
+
 .drag-region {
   user-select: none;
 }

@@ -14,6 +14,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import type {
   AppUpdateInfo,
   AppUpdateInstallResponse,
+  AppUpdateProgress,
   ConnectionSummary,
   DownloadResponse,
   FileActionResponse,
@@ -51,8 +52,20 @@ type FileActionDialogState = {
   busy: boolean;
   dangerText: string;
 };
+type UpdateNoticeKind = "available" | "progress" | "latest" | "error";
+type UpdateNoticeTone = "info" | "success" | "warning" | "error";
+type UpdateNoticeState = {
+  kind: UpdateNoticeKind;
+  tone: UpdateNoticeTone;
+  title: string;
+  message: string;
+  detail?: string;
+  version?: string | null;
+  sticky?: boolean;
+};
 
 const COMMAND_HISTORY_STORAGE_KEY = "fshell-command-history";
+const UPDATE_DISMISSED_VERSION_STORAGE_KEY = "fshell-update-dismissed-version";
 const COMMAND_HISTORY_LIMIT = 40;
 const GITHUB_RELEASES_PAGE_URL = "https://github.com/tangrufeii/f-shell/releases";
 const GITHUB_LATEST_JSON_URL = `${GITHUB_RELEASES_PAGE_URL}/latest/download/latest.json`;
@@ -131,6 +144,26 @@ function formatUpdatePubDate(value: string | null): string {
     hour: "2-digit",
     minute: "2-digit"
   }).format(parsed);
+}
+
+function formatUpdateDuration(durationMs: number | null): string {
+  if (!durationMs || durationMs <= 0) {
+    return "--";
+  }
+
+  if (durationMs < 1000) {
+    return `${Math.round(durationMs)} ms`;
+  }
+
+  return `${(durationMs / 1000).toFixed(durationMs >= 10_000 ? 0 : 1)} s`;
+}
+
+function clampPercent(value: number | null | undefined): number {
+  if (value == null || Number.isNaN(value)) {
+    return 0;
+  }
+
+  return Math.max(0, Math.min(100, value));
 }
 
 function formatPermissions(permissions: number | null): string {
@@ -381,6 +414,15 @@ function readStoredHistory(): string[] {
   } catch (error) {
     console.error(error);
     return [];
+  }
+}
+
+function readDismissedUpdateVersion(): string {
+  try {
+    return window.localStorage.getItem(UPDATE_DISMISSED_VERSION_STORAGE_KEY) ?? "";
+  } catch (error) {
+    console.error(error);
+    return "";
   }
 }
 
@@ -651,8 +693,11 @@ function App() {
   const [isWindowFullscreen, setIsWindowFullscreen] = useState(false);
   const [appVersion, setAppVersion] = useState("");
   const [updateInfo, setUpdateInfo] = useState<AppUpdateInfo | null>(null);
+  const [updateProgress, setUpdateProgress] = useState<AppUpdateProgress | null>(null);
+  const [updateNotice, setUpdateNotice] = useState<UpdateNoticeState | null>(null);
   const [isCheckingUpdate, setIsCheckingUpdate] = useState(false);
   const [isInstallingUpdate, setIsInstallingUpdate] = useState(false);
+  const [updateCheckDurationMs, setUpdateCheckDurationMs] = useState<number | null>(null);
   const [connectError, setConnectError] = useState("");
   const [connectFieldErrors, setConnectFieldErrors] = useState<ConnectFieldErrors>({});
   const [treeContextMenu, setTreeContextMenu] = useState<TreeContextMenuState | null>(null);
@@ -678,6 +723,7 @@ function App() {
   const terminalSearchMatchesRef = useRef<TerminalSearchMatch[]>([]);
   const previewSearchMatchesRef = useRef<TextSearchMatch[]>([]);
   const pendingTerminalDraftSyncRef = useRef(false);
+  const hasAutoUpdateCheckRef = useRef(false);
 
   useEffect(() => {
     void bootstrap();
@@ -751,6 +797,9 @@ function App() {
         setTreeContextMenu(null);
         setFileActionDialog(null);
         setIsAboutDialogOpen(false);
+        if (updateNotice?.kind !== "progress") {
+          setUpdateNotice(null);
+        }
       }
     };
 
@@ -767,15 +816,106 @@ function App() {
       window.removeEventListener("resize", closeMenu);
       window.removeEventListener("scroll", closeMenu, true);
     };
-  }, []);
+  }, [updateNotice?.kind]);
 
   useEffect(() => {
     if (!isAboutDialogOpen || updateInfo || isCheckingUpdate) {
       return;
     }
 
-    void checkAppUpdate();
+    void checkAppUpdate({ reason: "manual", silentNoUpdate: true });
   }, [isAboutDialogOpen, isCheckingUpdate, updateInfo]);
+
+  useEffect(() => {
+    if (!updateNotice || updateNotice.sticky) {
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      setUpdateNotice((previous) => (previous === updateNotice ? null : previous));
+    }, 5200);
+
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [updateNotice]);
+
+  useEffect(() => {
+    let unlistenUpdateProgress: (() => void) | undefined;
+
+    void listen<AppUpdateProgress>("update-progress", (event) => {
+      const payload = event.payload;
+      setUpdateProgress(payload);
+      setStatusLine(payload.message);
+
+      if (payload.stage === "downloading" || payload.stage === "installing" || payload.stage === "preparing") {
+        setUpdateNotice({
+          kind: "progress",
+          tone: "info",
+          title:
+            payload.stage === "installing"
+              ? `正在安装 ${payload.version ?? "更新"}`
+              : payload.stage === "preparing"
+                ? "正在准备更新"
+                : `正在下载 ${payload.version ?? "更新"}`,
+          message: payload.message,
+          detail:
+            payload.totalBytes && payload.downloadedBytes != null
+              ? `${formatBytes(payload.downloadedBytes)} / ${formatBytes(payload.totalBytes)}`
+              : "GitHub Releases 直连、代理和签名校验都会影响速度。",
+          version: payload.version,
+          sticky: true
+        });
+        return;
+      }
+
+      if (payload.stage === "completed") {
+        setUpdateNotice({
+          kind: "progress",
+          tone: "success",
+          title: `更新 ${payload.version ?? ""} 已安装`,
+          message: payload.message,
+          detail: "应用即将自动重启。",
+          version: payload.version,
+          sticky: true
+        });
+        return;
+      }
+
+      if (payload.stage === "idle") {
+        setUpdateNotice({
+          kind: "latest",
+          tone: "success",
+          title: "当前已经是最新版本",
+          message: payload.message,
+          detail: "本次没有检测到更高版本。",
+          version: payload.version,
+          sticky: false
+        });
+      }
+    }).then((fn) => {
+      unlistenUpdateProgress = fn;
+    });
+
+    return () => {
+      unlistenUpdateProgress?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!appVersion || hasAutoUpdateCheckRef.current) {
+      return;
+    }
+
+    hasAutoUpdateCheckRef.current = true;
+    const timer = window.setTimeout(() => {
+      void checkAppUpdate({ reason: "startup", silentNoUpdate: true });
+    }, 1100);
+
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [appVersion]);
 
   useEffect(() => {
     if (activeWorkspace !== "terminal") {
@@ -1479,16 +1619,84 @@ function App() {
     }
   }
 
-  async function checkAppUpdate() {
+  function rememberUpdateLater(version: string | null | undefined) {
+    if (!version) {
+      setUpdateNotice(null);
+      return;
+    }
+
+    try {
+      window.localStorage.setItem(UPDATE_DISMISSED_VERSION_STORAGE_KEY, version);
+    } catch (error) {
+      console.error(error);
+    }
+    setUpdateNotice(null);
+  }
+
+  function openUpdateNotice(result: AppUpdateInfo, reason: "startup" | "manual") {
+    const dismissedVersion = readDismissedUpdateVersion();
+    if (reason === "startup" && dismissedVersion && dismissedVersion === result.version) {
+      return;
+    }
+
+    setUpdateNotice({
+      kind: "available",
+      tone: "warning",
+      title: `发现新版本 v${result.version}`,
+      message: result.message,
+      detail: result.notes?.trim() || "这次 Release 没额外写说明，但安装包和签名已经就位。",
+      version: result.version,
+      sticky: true
+    });
+  }
+
+  async function checkAppUpdate(options?: { reason?: "startup" | "manual"; silentNoUpdate?: boolean }) {
+    if (isCheckingUpdate) {
+      return;
+    }
+
+    const reason = options?.reason ?? "manual";
+    const startedAt = window.performance.now();
     setIsCheckingUpdate(true);
+    setStatusLine(reason === "startup" ? "正在后台检查更新..." : "正在检查更新...");
     try {
       const result = await invoke<AppUpdateInfo>("check_app_update");
+      setUpdateCheckDurationMs(window.performance.now() - startedAt);
       setUpdateInfo(result);
       setAppVersion(result.currentVersion);
       setStatusLine(result.message);
+      if (result.available && result.version) {
+        setUpdateProgress(null);
+        openUpdateNotice(result, reason);
+        return;
+      }
+
+      if (!options?.silentNoUpdate) {
+        setUpdateNotice({
+          kind: "latest",
+          tone: "success",
+          title: "当前已经是最新版本",
+          message: result.message,
+          detail: "这次检查没有发现更高版本。",
+          version: result.currentVersion,
+          sticky: false
+        });
+      }
     } catch (error) {
       console.error(error);
-      setStatusLine(`检查更新失败: ${String(error)}`);
+      const message = `检查更新失败: ${String(error)}`;
+      setUpdateCheckDurationMs(window.performance.now() - startedAt);
+      setStatusLine(message);
+      if (reason !== "startup") {
+        setUpdateNotice({
+          kind: "error",
+          tone: "error",
+          title: "检查更新失败",
+          message,
+          detail: "GitHub 访问、代理状态和签名校验都会影响更新检查。",
+          sticky: false
+        });
+      }
     } finally {
       setIsCheckingUpdate(false);
     }
@@ -1500,12 +1708,40 @@ function App() {
     }
 
     setIsInstallingUpdate(true);
+    setUpdateNotice({
+      kind: "progress",
+      tone: "info",
+      title: "正在准备安装更新",
+      message: "先确认远端版本和安装包签名，稍等一下。",
+      detail: "更新包来自 GitHub Releases。",
+      version: updateInfo?.version ?? null,
+      sticky: true
+    });
     try {
       const result = await invoke<AppUpdateInstallResponse>("install_app_update");
       setStatusLine(result.message);
+      setUpdateNotice({
+        kind: "progress",
+        tone: "success",
+        title: `更新 ${result.version} 已安装`,
+        message: result.message,
+        detail: "应用会自动重启，重启后就是新版本。",
+        version: result.version,
+        sticky: true
+      });
     } catch (error) {
       console.error(error);
-      setStatusLine(`安装更新失败: ${String(error)}`);
+      const message = `安装更新失败: ${String(error)}`;
+      setStatusLine(message);
+      setUpdateNotice({
+        kind: "error",
+        tone: "error",
+        title: "安装更新失败",
+        message,
+        detail: "可以稍后重试，或者去 GitHub Release 页面手动下载安装包。",
+        version: updateInfo?.version ?? null,
+        sticky: true
+      });
     } finally {
       setIsInstallingUpdate(false);
     }
@@ -2058,6 +2294,7 @@ function App() {
   const updateButtonTitle = updateInfo?.available
     ? [updateInfo.message, updateInfo.notes].filter(Boolean).join("\n\n")
     : `当前版本 ${appVersion || "--"}`;
+  const updateProgressPercent = clampPercent(updateProgress?.progressPercent);
   const releasePageUrl = updateInfo?.version
     ? `${GITHUB_RELEASES_PAGE_URL}/tag/v${updateInfo.version}`
     : GITHUB_RELEASES_PAGE_URL;
@@ -2073,6 +2310,20 @@ function App() {
       : updateInfo?.available && updateInfo.version
         ? `安装 ${updateInfo.version}`
         : "检查更新";
+  const updateLatencyLabel = isCheckingUpdate ? "检查中..." : formatUpdateDuration(updateCheckDurationMs);
+  const updateProgressStatusLabel =
+    isCheckingUpdate
+      ? "正在检查更新"
+      : updateProgress?.stage === "installing"
+      ? "正在安装更新"
+      : updateProgress?.stage === "completed"
+        ? "更新已就绪"
+        : updateProgress?.stage === "preparing"
+          ? "准备更新"
+          : updateProgress?.stage === "downloading"
+            ? "正在下载更新"
+            : "等待更新操作";
+  const updateNoticeClass = updateNotice ? `update-notice ${updateNotice.tone}` : "update-notice";
   const currentEntries = currentPath ? entriesByPath[currentPath] ?? [] : entriesByPath["/"] ?? [];
   const currentDirCount = currentEntries.filter((entry) => entry.isDir).length;
   const currentFileCount = currentEntries.filter((entry) => !entry.isDir).length;
@@ -2100,6 +2351,89 @@ function App() {
       <div className="aurora aurora-one" />
       <div className="aurora aurora-two" />
       <div className="aurora aurora-three" />
+
+      {updateNotice ? (
+        <aside className={updateNoticeClass}>
+          <div className="update-notice-head">
+            <span className={`update-notice-badge ${updateNotice.tone}`}>{updateNotice.kind === "available" ? "新版本" : updateNotice.kind === "progress" ? "更新中" : updateNotice.kind === "error" ? "失败" : "已检查"}</span>
+            <button
+              className="ghost-button small update-notice-close"
+              disabled={updateNotice.kind === "progress" && isInstallingUpdate}
+              onClick={() => {
+                if (updateNotice.kind === "progress" && isInstallingUpdate) {
+                  return;
+                }
+                setUpdateNotice(null);
+              }}
+            >
+              关闭
+            </button>
+          </div>
+          <div className="update-notice-copy">
+            <strong>{updateNotice.title}</strong>
+            <p>{updateNotice.message}</p>
+            {updateNotice.detail ? <small>{updateNotice.detail}</small> : null}
+          </div>
+
+          {updateNotice.kind === "progress" ? (
+            <div className="update-progress-block">
+              <div className="update-progress-meta">
+                <span>{updateProgressStatusLabel}</span>
+                <strong>{Math.round(updateProgressPercent)}%</strong>
+              </div>
+              <div className="update-progress-track">
+                <div className="update-progress-fill" style={{ width: `${updateProgressPercent}%` }} />
+              </div>
+            </div>
+          ) : null}
+
+          <div className="update-notice-actions">
+            {updateNotice.kind === "available" ? (
+              <>
+                <button
+                  className="primary-button small-primary"
+                  disabled={isInstallingUpdate}
+                  onClick={() => void installAppUpdate()}
+                >
+                  现在更新
+                </button>
+                <button
+                  className="ghost-button small"
+                  onClick={() => rememberUpdateLater(updateNotice.version)}
+                >
+                  下次再说
+                </button>
+                <button
+                  className="ghost-button small"
+                  onClick={() => {
+                    setIsAboutDialogOpen(true);
+                    setUpdateNotice(null);
+                  }}
+                >
+                  查看详情
+                </button>
+              </>
+            ) : updateNotice.kind === "error" ? (
+              <>
+                <button className="primary-button small-primary" onClick={() => void checkAppUpdate({ reason: "manual" })}>
+                  重新检查
+                </button>
+                <button className="ghost-button small" onClick={() => setIsAboutDialogOpen(true)}>
+                  打开更新面板
+                </button>
+              </>
+            ) : updateNotice.kind === "latest" ? (
+              <button className="ghost-button small" onClick={() => setIsAboutDialogOpen(true)}>
+                查看版本详情
+              </button>
+            ) : (
+              <button className="ghost-button small" onClick={() => setIsAboutDialogOpen(true)}>
+                打开更新面板
+              </button>
+            )}
+          </div>
+        </aside>
+      ) : null}
 
       <div
         className="corner-toolbar glass-panel drag-region"
@@ -2752,6 +3086,26 @@ function App() {
                 <span>更新源</span>
                 <strong>GitHub Releases</strong>
                 <small>latest.json + installer signatures</small>
+              </div>
+              <div className="about-card">
+                <span>检查耗时</span>
+                <strong>{updateLatencyLabel}</strong>
+                <small>GitHub 访问、代理状态和签名校验都会拖慢这里。</small>
+              </div>
+              <div className="about-card">
+                <span>当前阶段</span>
+                <strong>{updateProgressStatusLabel}</strong>
+                <small>{isInstallingUpdate ? "安装进行中，别急着重复点击。" : "启动后会自动后台检查一次。"}</small>
+              </div>
+            </div>
+
+            <div className="about-progress-block">
+              <div className="update-progress-meta">
+                <span>{updateProgress?.message ?? "还没有开始下载安装，发现新版本后这里会显示实时进度。"}</span>
+                <strong>{Math.round(updateProgressPercent)}%</strong>
+              </div>
+              <div className="update-progress-track">
+                <div className="update-progress-fill" style={{ width: `${updateProgressPercent}%` }} />
               </div>
             </div>
 
