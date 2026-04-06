@@ -1852,7 +1852,10 @@ function App() {
     const profile = {
       ...buildConnectionProfile(sourceForm, currentProfileId || undefined),
       pinned: existingProfile?.pinned ?? false,
-      lastUsedAt: existingProfile?.lastUsedAt ?? null
+      lastUsedAt: existingProfile?.lastUsedAt ?? null,
+      lastConnectionOutcome: existingProfile?.lastConnectionOutcome ?? null,
+      lastConnectionMessage: existingProfile?.lastConnectionMessage ?? null,
+      lastConnectionAt: existingProfile?.lastConnectionAt ?? null
     };
     setConnectionProfiles((previous) => upsertConnectionProfile(previous, profile));
     setActiveProfileId(profile.id);
@@ -1906,6 +1909,25 @@ function App() {
     );
   }
 
+  function markConnectionProfileResult(profileId: string, outcome: "success" | "error", message: string) {
+    const recordedAt = new Date().toISOString();
+    setConnectionProfiles((previous) =>
+      sortConnectionProfiles(
+        previous.map((item) =>
+          item.id === profileId
+            ? {
+                ...item,
+                lastConnectionOutcome: outcome,
+                lastConnectionMessage: message.trim() || null,
+                lastConnectionAt: recordedAt,
+                updatedAt: recordedAt
+              }
+            : item
+        )
+      )
+    );
+  }
+
   function toggleConnectionProfilePin(profileId: string) {
     setConnectionProfiles((previous) =>
       sortConnectionProfiles(
@@ -1923,6 +1945,7 @@ function App() {
 
   async function connect(options?: { formOverride?: ConnectionForm; profileIdOverride?: string }) {
     const sourceForm = options?.formOverride ?? form;
+    const trackedProfileId = options?.profileIdOverride ?? resolveCurrentProfileId();
     const errors = validateConnectForm(sourceForm);
     setConnectFieldErrors(errors);
     setConnectError("");
@@ -1977,6 +2000,7 @@ function App() {
       });
       if (savedProfileId) {
         markConnectionProfileUsed(savedProfileId);
+        markConnectionProfileResult(savedProfileId, "success", `最近成功连接到 ${result.host}`);
       }
       setConnectionProgress((previous) =>
         previous
@@ -2017,6 +2041,9 @@ function App() {
         isError: true
       }));
       terminalRef.current?.writeln(`\r\n[connect error] ${message}`);
+      if (trackedProfileId && connectionProfiles.some((item) => item.id === trackedProfileId)) {
+        markConnectionProfileResult(trackedProfileId, "error", message);
+      }
       const refreshed = await invoke<ShellOverview>("get_shell_overview");
       setOverview(refreshed);
     } finally {
@@ -3329,6 +3356,7 @@ function App() {
     return haystack.includes(normalizedProfileSearchQuery);
   });
   const recentConnectionProfiles = connectionProfiles.filter((item) => item.lastUsedAt).slice(0, 4);
+  const failedConnectionProfiles = connectionProfiles.filter((item) => item.lastConnectionOutcome === "error").length;
   const pinnedConnectionProfiles = connectionProfiles.filter((item) => item.pinned).length;
   const connectedProfileId = connection ? activeProfileId : "";
   const connectionStageLabel = formatConnectionStage(connectionProgress?.stage);
@@ -3530,6 +3558,7 @@ function App() {
         connectedProfileId={connectedProfileId}
         connectionProfiles={connectionProfiles}
         recentConnectionProfiles={recentConnectionProfiles}
+        failedConnectionProfiles={failedConnectionProfiles}
         isSavedProfilesMenuOpen={isSavedProfilesMenuOpen}
         onWindowMouseDown={(event) => {
           void startWindowDragging(event);
@@ -3955,6 +3984,7 @@ function App() {
         visibleConnectionProfiles={visibleConnectionProfiles}
         recentConnectionProfiles={recentConnectionProfiles}
         pinnedConnectionProfiles={pinnedConnectionProfiles}
+        failedConnectionProfiles={failedConnectionProfiles}
         activeProfileId={activeProfileId}
         connectedProfileId={connectedProfileId}
         profileSearchQuery={profileSearchQuery}

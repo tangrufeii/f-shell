@@ -27,6 +27,7 @@ type ConnectDialogProps = {
   visibleConnectionProfiles: ConnectionProfile[];
   recentConnectionProfiles: ConnectionProfile[];
   pinnedConnectionProfiles: number;
+  failedConnectionProfiles: number;
   activeProfileId: string;
   connectedProfileId: string;
   profileSearchQuery: string;
@@ -93,6 +94,7 @@ export default function ConnectDialog({
   visibleConnectionProfiles,
   recentConnectionProfiles,
   pinnedConnectionProfiles,
+  failedConnectionProfiles,
   activeProfileId,
   connectedProfileId,
   profileSearchQuery,
@@ -277,6 +279,7 @@ export default function ConnectDialog({
                       {visibleConnectionProfiles.length} / {connectionProfiles.length} 项
                     </span>
                     <span className="toolbar-hint">置顶 {pinnedConnectionProfiles}</span>
+                    <span className="toolbar-hint">最近失败 {failedConnectionProfiles}</span>
                   </div>
 
                   {visibleConnectionProfiles.length ? (
@@ -290,9 +293,18 @@ export default function ConnectDialog({
                             <strong>{profile.name}</strong>
                             {connectedProfileId === profile.id ? <span className="connection-profile-badge online">当前在线</span> : null}
                             {profile.pinned ? <span className="connection-profile-badge pinned">置顶</span> : null}
+                            {profile.lastConnectionOutcome === "error" ? <span className="connection-profile-badge error">上次失败</span> : null}
                           </div>
                           <span>{profile.username}@{profile.host}:{profile.port}</span>
-                          <small>{profile.lastUsedAt ? `最近使用 ${formatTime(profile.lastUsedAt)}` : "尚未使用"}</small>
+                          <small>
+                            {profile.lastConnectionOutcome === "error"
+                              ? profile.lastConnectionAt
+                                ? `失败时间 ${formatTime(profile.lastConnectionAt)}`
+                                : profile.lastConnectionMessage || "上次连接失败"
+                              : profile.lastUsedAt
+                                ? `最近使用 ${formatTime(profile.lastUsedAt)}`
+                                : "尚未使用"}
+                          </small>
                         </button>
                         <div className="profile-item-actions">
                           <button

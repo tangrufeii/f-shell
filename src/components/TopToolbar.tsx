@@ -1,4 +1,4 @@
-import type { MouseEventHandler, Ref } from "react";
+import { useEffect, useRef, useState, type MouseEventHandler, type Ref } from "react";
 import type { AppUpdateInfo, ConnectionSummary } from "../types";
 import type { ConnectionProfile } from "../lib/connectionProfiles";
 
@@ -26,6 +26,7 @@ type TopToolbarProps = {
   connectedProfileId: string;
   connectionProfiles: ConnectionProfile[];
   recentConnectionProfiles: ConnectionProfile[];
+  failedConnectionProfiles: number;
   isSavedProfilesMenuOpen: boolean;
   onWindowMouseDown: MouseEventHandler<HTMLDivElement>;
   onWindowDoubleClick: MouseEventHandler<HTMLDivElement>;
@@ -70,6 +71,7 @@ export default function TopToolbar({
   connectedProfileId,
   connectionProfiles,
   recentConnectionProfiles,
+  failedConnectionProfiles,
   isSavedProfilesMenuOpen,
   onWindowMouseDown,
   onWindowDoubleClick,
@@ -89,6 +91,31 @@ export default function TopToolbar({
   onCloseWindow,
   formatTime
 }: TopToolbarProps) {
+  const [profileMenuQuery, setProfileMenuQuery] = useState("");
+  const profileMenuInputRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    if (!isSavedProfilesMenuOpen) {
+      setProfileMenuQuery("");
+      return;
+    }
+
+    window.setTimeout(() => {
+      profileMenuInputRef.current?.focus();
+    }, 0);
+  }, [isSavedProfilesMenuOpen]);
+
+  const normalizedProfileMenuQuery = profileMenuQuery.trim().toLocaleLowerCase();
+  const visibleSavedProfiles = normalizedProfileMenuQuery
+    ? connectionProfiles.filter((profile) =>
+        [profile.name, profile.host, profile.port, profile.username, profile.lastConnectionMessage]
+          .filter(Boolean)
+          .join(" ")
+          .toLocaleLowerCase()
+          .includes(normalizedProfileMenuQuery)
+      )
+    : connectionProfiles;
+
   return (
     <div className="corner-toolbar glass-panel drag-region" onMouseDown={onWindowMouseDown} onDoubleClick={onWindowDoubleClick}>
       <div className="toolbar-host">
@@ -149,7 +176,17 @@ export default function TopToolbar({
             <div className="saved-profiles-menu floating-overlay-panel">
               <div className="saved-profiles-menu-head">
                 <strong>快速切换连接</strong>
-                <span>{connectionProfiles.length} 项</span>
+                <span>{failedConnectionProfiles} 条最近失败 / {connectionProfiles.length} 项</span>
+              </div>
+              <div className="saved-profiles-search-row">
+                <input
+                  ref={profileMenuInputRef}
+                  className="toolbar-input saved-profile-search-input"
+                  placeholder="搜索名称、主机、账号或状态"
+                  value={profileMenuQuery}
+                  onChange={(event) => setProfileMenuQuery(event.target.value)}
+                />
+                <span className="toolbar-hint">{visibleSavedProfiles.length} 条可见</span>
               </div>
               {recentConnectionProfiles.length ? (
                 <div className="saved-profiles-recent">
@@ -162,7 +199,13 @@ export default function TopToolbar({
                       title={`快速重连 ${profile.username}@${profile.host}:${profile.port}`}
                     >
                       <strong>{profile.name}</strong>
-                      <small>{profile.lastUsedAt ? formatTime(profile.lastUsedAt) : "未使用"}</small>
+                      <small>
+                        {profile.lastConnectionOutcome === "error"
+                          ? "上次连接失败"
+                          : profile.lastUsedAt
+                            ? formatTime(profile.lastUsedAt)
+                            : "未使用"}
+                      </small>
                     </button>
                   ))}
                 </div>
@@ -177,7 +220,7 @@ export default function TopToolbar({
               </div>
               {connectionProfiles.length ? (
                 <div className="saved-profiles-list">
-                  {connectionProfiles.slice(0, 8).map((profile) => (
+                  {visibleSavedProfiles.slice(0, 8).map((profile) => (
                     <button
                       key={profile.id}
                       className={`saved-profile-option ${activeProfileId === profile.id ? "active" : ""}`}
@@ -185,11 +228,19 @@ export default function TopToolbar({
                       onClick={() => onConnectWithProfile(profile)}
                       title={`连接 ${profile.username}@${profile.host}:${profile.port}`}
                     >
-                      <strong>{profile.name}</strong>
+                      <strong>
+                        {profile.name}
+                        {profile.lastConnectionOutcome === "error" ? <span className="saved-profile-badge error">失败</span> : null}
+                        {profile.pinned ? <span className="saved-profile-badge pinned">置顶</span> : null}
+                      </strong>
                       <span>{profile.username}@{profile.host}:{profile.port}</span>
                       <small>
                         {connectedProfileId === profile.id
                           ? "当前在线"
+                          : profile.lastConnectionOutcome === "error"
+                            ? profile.lastConnectionAt
+                              ? `上次失败 ${formatTime(profile.lastConnectionAt)}`
+                              : profile.lastConnectionMessage || "上次连接失败"
                           : profile.lastUsedAt
                             ? `最近使用 ${formatTime(profile.lastUsedAt)}`
                             : "点击后直接重连"}
@@ -203,6 +254,12 @@ export default function TopToolbar({
                   <span>连接成功后会自动保留，也可以手动保存当前配置。</span>
                 </div>
               )}
+              {connectionProfiles.length && !visibleSavedProfiles.length ? (
+                <div className="saved-profiles-empty compact-saved-profiles-empty">
+                  <strong>没有匹配的连接</strong>
+                  <span>换个关键词试试，或者直接打开配置面板管理保存项。</span>
+                </div>
+              ) : null}
             </div>
           ) : null}
         </div>

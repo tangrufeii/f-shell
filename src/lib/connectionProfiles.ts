@@ -14,6 +14,9 @@ export type ConnectionProfile = {
   username: string;
   pinned: boolean;
   lastUsedAt: string | null;
+  lastConnectionOutcome: "success" | "error" | null;
+  lastConnectionMessage: string | null;
+  lastConnectionAt: string | null;
   updatedAt: string;
 };
 
@@ -64,6 +67,12 @@ function sanitizeConnectionProfile(value: unknown): ConnectionProfile | null {
     username: candidate.username,
     pinned: Boolean(candidate.pinned),
     lastUsedAt: typeof candidate.lastUsedAt === "string" ? candidate.lastUsedAt : null,
+    lastConnectionOutcome:
+      candidate.lastConnectionOutcome === "success" || candidate.lastConnectionOutcome === "error"
+        ? candidate.lastConnectionOutcome
+        : null,
+    lastConnectionMessage: typeof candidate.lastConnectionMessage === "string" ? candidate.lastConnectionMessage : null,
+    lastConnectionAt: typeof candidate.lastConnectionAt === "string" ? candidate.lastConnectionAt : null,
     updatedAt: candidate.updatedAt
   };
 }
@@ -163,6 +172,9 @@ export function buildConnectionProfile(form: ConnectionForm, profileId?: string)
     username: form.username.trim(),
     pinned: false,
     lastUsedAt: null,
+    lastConnectionOutcome: null,
+    lastConnectionMessage: null,
+    lastConnectionAt: null,
     updatedAt: now
   };
 }

@@ -478,6 +478,17 @@ textarea {
   flex-wrap: wrap;
 }
 
+.saved-profiles-search-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.saved-profile-search-input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
 .saved-profiles-recent {
   display: flex;
   gap: 8px;
@@ -558,10 +569,40 @@ textarea {
   font-size: 12px;
 }
 
+.saved-profile-option strong {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
 .saved-profile-option small,
 .saved-profiles-empty span {
   color: var(--text-soft);
   font-size: 11px;
+}
+
+.saved-profile-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 18px;
+  padding: 0 6px;
+  border-radius: 999px;
+  font-size: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.1);
+  color: rgba(248, 251, 255, 0.88);
+}
+
+.saved-profile-badge.error {
+  background: rgba(255, 92, 120, 0.18);
+  border-color: rgba(255, 136, 164, 0.24);
+}
+
+.saved-profile-badge.pinned {
+  background: rgba(255, 198, 66, 0.18);
+  border-color: rgba(255, 216, 124, 0.22);
+  color: #fff4cf;
 }
 
 .saved-profiles-empty {
@@ -571,6 +612,11 @@ textarea {
   border-radius: 16px;
   background: rgba(255, 255, 255, 0.08);
   border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.compact-saved-profiles-empty {
+  min-height: 0;
+  padding-top: 4px;
 }
 
 .window-button {
@@ -1862,6 +1908,12 @@ h3 {
   background: rgba(255, 198, 66, 0.18);
   border-color: rgba(255, 216, 124, 0.22);
   color: #fff4cf;
+}
+
+.connection-profile-badge.error {
+  background: rgba(255, 92, 120, 0.18);
+  border-color: rgba(255, 136, 164, 0.24);
+  color: #ffd9e2;
 }
 
 .connection-profile-main span {
