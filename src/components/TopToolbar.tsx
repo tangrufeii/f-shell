@@ -97,7 +97,7 @@ export default function TopToolbar({
               主机详情
             </button>
             {connection ? (
-              <div className="detail-card">
+              <div className="detail-card floating-overlay-panel">
                 <div className="detail-card-grid">
                   <div className="detail-item">
                     <span>主机</span>
@@ -136,7 +136,7 @@ export default function TopToolbar({
             {savedProfilesLabel}
           </button>
           {isSavedProfilesMenuOpen ? (
-            <div className="saved-profiles-menu glass-panel">
+            <div className="saved-profiles-menu floating-overlay-panel">
               <div className="saved-profiles-menu-head">
                 <strong>快速切换连接</strong>
                 <span>{connectionProfiles.length} 项</span>

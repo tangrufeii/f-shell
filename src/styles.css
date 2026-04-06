@@ -421,19 +421,39 @@ textarea {
   position: relative;
 }
 
+.floating-overlay-panel {
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  box-shadow:
+    0 24px 50px rgba(10, 18, 35, 0.28),
+    0 0 0 1px rgba(8, 14, 26, 0.18);
+  backdrop-filter: blur(18px) saturate(138%);
+  -webkit-backdrop-filter: blur(18px) saturate(138%);
+}
+
+.floating-overlay-panel::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background:
+    linear-gradient(180deg, rgba(33, 50, 88, 0.94), rgba(15, 24, 45, 0.96)),
+    radial-gradient(circle at top right, rgba(128, 192, 255, 0.16), transparent 40%);
+}
+
 .saved-profiles-menu {
   position: absolute;
   top: calc(100% + 10px);
   right: 0;
-  z-index: 7;
+  z-index: 16;
   display: grid;
   gap: 10px;
   width: min(360px, calc(100vw - 44px));
   padding: 12px;
   border-radius: 20px;
-  background: rgba(18, 28, 52, 0.82);
-  border: 1px solid rgba(255, 255, 255, 0.14);
-  box-shadow: 0 24px 50px rgba(10, 18, 35, 0.28);
+  background: rgba(14, 22, 40, 0.92);
 }
 
 .saved-profiles-menu-head,
@@ -472,20 +492,22 @@ textarea {
   min-width: 0;
   padding: 12px 14px;
   border-radius: 16px;
-  background: rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.1);
   color: var(--text-strong);
   text-align: left;
-  transition: transform 160ms ease, background 160ms ease, opacity 160ms ease;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  transition: transform 160ms ease, background 160ms ease, opacity 160ms ease, border-color 160ms ease;
 }
 
 .saved-profile-option:hover {
   transform: translateY(-1px);
-  background: rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.16);
+  border-color: rgba(255, 255, 255, 0.16);
 }
 
 .saved-profile-option.active {
-  background: rgba(82, 152, 255, 0.2);
-  border: 1px solid rgba(110, 176, 255, 0.24);
+  background: rgba(82, 152, 255, 0.22);
+  border: 1px solid rgba(110, 176, 255, 0.32);
 }
 
 .saved-profile-option strong,
@@ -513,7 +535,8 @@ textarea {
   gap: 4px;
   padding: 12px 14px;
   border-radius: 16px;
-  background: rgba(255, 255, 255, 0.06);
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.08);
 }
 
 .window-button {
@@ -849,15 +872,11 @@ textarea {
   width: 320px;
   padding: 14px;
   border-radius: 20px;
-  background: rgba(18, 28, 52, 0.78);
-  border: 1px solid rgba(255, 255, 255, 0.14);
-  box-shadow: 0 24px 50px rgba(10, 18, 35, 0.28);
-  backdrop-filter: blur(18px);
-  -webkit-backdrop-filter: blur(18px);
+  background: rgba(14, 22, 40, 0.92);
   opacity: 0;
   pointer-events: none;
   transition: opacity 160ms ease, transform 160ms ease;
-  z-index: 3;
+  z-index: 16;
 }
 
 .detail-hover:hover .detail-card,
@@ -1995,9 +2014,21 @@ h3 {
   width: 240px;
   padding: 10px;
   border-radius: 18px;
-  background: rgba(255, 255, 255, 0.08);
+  background: rgba(12, 20, 38, 0.94);
   border: 1px solid rgba(255, 255, 255, 0.12);
   box-shadow: 0 18px 42px rgba(10, 18, 35, 0.2);
+  isolation: isolate;
+  overflow: hidden;
+}
+
+.tree-context-menu::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background:
+    linear-gradient(180deg, rgba(29, 43, 76, 0.96), rgba(12, 20, 38, 0.98)),
+    radial-gradient(circle at top right, rgba(120, 188, 255, 0.14), transparent 42%);
 }
 
 .tree-context-menu-head {
@@ -2397,6 +2428,17 @@ h3 {
   -webkit-backdrop-filter: none;
   overflow: auto;
   z-index: 6;
+  isolation: isolate;
+}
+
+.history-menu::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background:
+    linear-gradient(180deg, rgba(25, 40, 72, 0.96), rgba(12, 20, 38, 0.98)),
+    radial-gradient(circle at top right, rgba(120, 188, 255, 0.1), transparent 42%);
 }
 
 .history-menu-header {
