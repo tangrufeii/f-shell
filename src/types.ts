@@ -104,3 +104,18 @@ export interface TerminalStatus {
   kind: string;
   message: string;
 }
+
+export interface ConnectionProgress {
+  stage: string;
+  message: string;
+  detail?: string | null;
+  currentStep: number;
+  totalSteps: number;
+  isError: boolean;
+}
+
+export interface CommandHistoryItem {
+  command: string;
+  cwd: string;
+  updatedAt: string;
+}

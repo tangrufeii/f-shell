@@ -2,7 +2,7 @@ use std::{
     env,
     fs,
     io::{ErrorKind, Read, Write},
-    net::TcpStream,
+    net::{TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
     sync::{mpsc, MutexGuard},
     thread,
@@ -12,7 +12,7 @@ use std::{
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use rfd::FileDialog;
 use ssh2::{FileStat, OpenFlags, OpenType, Session};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 #[cfg(desktop)]
 use tauri_plugin_updater::UpdaterExt;
 use url::Url;
@@ -20,14 +20,17 @@ use url::Url;
 use crate::{
     models::{
         AppUpdateInfo, AppUpdateInstallResponse, AppUpdateProgress, ConnectRequest,
-        ConnectionSummary, DownloadResponse, FileActionResponse, FilePreview, RemoteEntry,
-        SaveResponse, ShellOverview, TerminalChunk, TerminalStatus, UploadResponse,
+        ConnectionProgress, ConnectionSummary, DownloadResponse, FileActionResponse, FilePreview,
+        RemoteEntry, SaveResponse, ShellOverview, TerminalChunk, TerminalStatus, UploadResponse,
     },
     state::{AppState, StoredConnection, TerminalCommand, TerminalHandle},
 };
 
 const TEXT_PREVIEW_LIMIT: u64 = 512 * 1024;
 const IMAGE_PREVIEW_LIMIT: u64 = 12 * 1024 * 1024;
+const SSH_CONNECT_TIMEOUT: Duration = Duration::from_secs(6);
+const SSH_IO_TIMEOUT: Duration = Duration::from_secs(12);
+const CONNECT_TOTAL_STEPS: u8 = 5;
 
 #[tauri::command]
 pub async fn check_app_update(app: AppHandle) -> Result<AppUpdateInfo, String> {
@@ -222,82 +225,164 @@ pub fn get_shell_overview(state: State<'_, AppState>) -> Result<ShellOverview, S
 }
 
 #[tauri::command]
-pub fn connect_ssh(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    request: ConnectRequest,
-) -> Result<ConnectionSummary, String> {
-    disconnect_ssh(state.clone())?;
-
-    let started_at = Instant::now();
-    let session = create_authenticated_session(&request)?;
-    let home_path = resolve_home_path(&session)?;
-    let (user_uid, group_ids) = resolve_remote_identity(&session).unwrap_or((None, Vec::new()));
-    let summary = ConnectionSummary {
-        id: format!(
-            "ssh-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|error| error.to_string())?
-                .as_millis()
-        ),
-        name: request
-            .name
-            .clone()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| format!("{}@{}", request.username, request.host)),
-        host: format!("{}:{}", request.host, request.port),
-        protocol: "SSH + SFTP".into(),
-        status: "Connected".into(),
-        latency_ms: started_at.elapsed().as_millis() as u64,
-        os_label: "Remote Linux".into(),
-        home_path: home_path.clone(),
-    };
-
-    let mut channel = session.channel_session().map_err(to_error)?;
-    channel
-        .request_pty(
-            "xterm-256color",
-            None,
-            Some((u32::from(request.cols), u32::from(request.rows), 0, 0)),
-        )
-        .map_err(to_error)?;
-    channel.shell().map_err(to_error)?;
-    session.set_blocking(false);
-
-    let (tx, rx) = mpsc::channel::<TerminalCommand>();
-    spawn_terminal_worker(app, session, channel, rx);
-
-    let stored = StoredConnection {
-        host: request.host,
-        port: request.port,
-        username: request.username,
-        password: request.password,
-        home_path: home_path.clone(),
-        user_uid,
-        group_ids,
-        summary: summary.clone(),
-    };
-
-    *lock_connection(&state)? = Some(stored);
-    *state
-        .terminal
-        .lock()
-        .map_err(|_| "终端状态锁坏了".to_string())? = Some(TerminalHandle { sender: tx });
-    *state
-        .current_path
-        .lock()
-        .map_err(|_| "路径状态锁坏了".to_string())? = Some(home_path);
-    *state
-        .recent_files
-        .lock()
-        .map_err(|_| "最近文件状态锁坏了".to_string())? = Vec::new();
-
-    Ok(summary)
+pub async fn connect_ssh(app: AppHandle, request: ConnectRequest) -> Result<ConnectionSummary, String> {
+    let blocking_app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || connect_ssh_blocking(blocking_app, request))
+        .await
+        .map_err(|error| format!("连接任务被中断了: {error}"))?
 }
 
 #[tauri::command]
 pub fn disconnect_ssh(state: State<'_, AppState>) -> Result<(), String> {
+    clear_connection_state(&state)?;
+    Ok(())
+}
+
+fn connect_ssh_blocking(app: AppHandle, request: ConnectRequest) -> Result<ConnectionSummary, String> {
+    let state = app.state::<AppState>();
+    clear_connection_state(&state)?;
+    let result: Result<ConnectionSummary, String> = (|| {
+        emit_connection_progress(
+            &app,
+            ConnectionProgress {
+                stage: "tcp".into(),
+                message: "正在建立 TCP 连接...".into(),
+                detail: Some(format!(
+                    "{}:{} · 最多等待 {} 秒",
+                    request.host,
+                    request.port,
+                    SSH_CONNECT_TIMEOUT.as_secs()
+                )),
+                current_step: 1,
+                total_steps: CONNECT_TOTAL_STEPS,
+                is_error: false,
+            },
+        );
+
+        let started_at = Instant::now();
+        let session = create_authenticated_session(&app, &request)?;
+        emit_connection_progress(
+            &app,
+            ConnectionProgress {
+                stage: "prepare".into(),
+                message: "正在读取远端环境信息...".into(),
+                detail: Some("获取主目录和权限范围，给文件树与编辑器做初始化。".into()),
+                current_step: 4,
+                total_steps: CONNECT_TOTAL_STEPS,
+                is_error: false,
+            },
+        );
+
+        let home_path = resolve_home_path(&session)?;
+        let (user_uid, group_ids) = resolve_remote_identity(&session).unwrap_or((None, Vec::new()));
+        let summary = ConnectionSummary {
+            id: format!(
+                "ssh-{}",
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_err(|error| error.to_string())?
+                    .as_millis()
+            ),
+            name: request
+                .name
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| format!("{}@{}", request.username, request.host)),
+            host: format!("{}:{}", request.host, request.port),
+            protocol: "SSH + SFTP".into(),
+            status: "Connected".into(),
+            latency_ms: started_at.elapsed().as_millis() as u64,
+            os_label: "Remote Linux".into(),
+            home_path: home_path.clone(),
+        };
+
+        emit_connection_progress(
+            &app,
+            ConnectionProgress {
+                stage: "terminal".into(),
+                message: "正在启动交互终端...".into(),
+                detail: Some("PTY 建好后就能开始收发命令。".into()),
+                current_step: 5,
+                total_steps: CONNECT_TOTAL_STEPS,
+                is_error: false,
+            },
+        );
+
+        let mut channel = session.channel_session().map_err(to_error)?;
+        channel
+            .request_pty(
+                "xterm-256color",
+                None,
+                Some((u32::from(request.cols), u32::from(request.rows), 0, 0)),
+            )
+            .map_err(to_error)?;
+        channel.shell().map_err(to_error)?;
+        session.set_blocking(false);
+
+        let (tx, rx) = mpsc::channel::<TerminalCommand>();
+        spawn_terminal_worker(app.clone(), session, channel, rx);
+
+        let stored = StoredConnection {
+            host: request.host.clone(),
+            port: request.port,
+            username: request.username.clone(),
+            password: request.password.clone(),
+            home_path: home_path.clone(),
+            user_uid,
+            group_ids,
+            summary: summary.clone(),
+        };
+
+        *lock_connection(&state)? = Some(stored);
+        *state
+            .terminal
+            .lock()
+            .map_err(|_| "终端状态锁坏了".to_string())? = Some(TerminalHandle { sender: tx });
+        *state
+            .current_path
+            .lock()
+            .map_err(|_| "路径状态锁坏了".to_string())? = Some(home_path);
+        *state
+            .recent_files
+            .lock()
+            .map_err(|_| "最近文件状态锁坏了".to_string())? = Vec::new();
+
+        emit_connection_progress(
+            &app,
+            ConnectionProgress {
+                stage: "ready".into(),
+                message: format!("已连接到 {}", summary.host),
+                detail: Some(format!(
+                    "往返耗时约 {} ms，远端主目录是 {}",
+                    summary.latency_ms, summary.home_path
+                )),
+                current_step: CONNECT_TOTAL_STEPS,
+                total_steps: CONNECT_TOTAL_STEPS,
+                is_error: false,
+            },
+        );
+
+        Ok(summary)
+    })();
+
+    if let Err(message) = &result {
+        emit_connection_progress(
+            &app,
+            ConnectionProgress {
+                stage: "error".into(),
+                message: "SSH 连接失败".into(),
+                detail: Some(message.clone()),
+                current_step: 0,
+                total_steps: CONNECT_TOTAL_STEPS,
+                is_error: true,
+            },
+        );
+    }
+
+    result
+}
+
+fn clear_connection_state(state: &State<'_, AppState>) -> Result<(), String> {
     if let Some(handle) = state
         .terminal
         .lock()
@@ -312,7 +397,6 @@ pub fn disconnect_ssh(state: State<'_, AppState>) -> Result<(), String> {
         .current_path
         .lock()
         .map_err(|_| "路径状态锁坏了".to_string())? = None;
-
     Ok(())
 }
 
@@ -556,8 +640,8 @@ pub fn upload_windows_clipboard_files(
 
     #[cfg(windows)]
     {
-        let local_paths = windows_clipboard::read_clipboard_file_paths()?;
-        if local_paths.is_empty() {
+        let clipboard_items = windows_clipboard::read_clipboard_items()?;
+        if clipboard_items.is_empty() {
             return Ok(Vec::new());
         }
 
@@ -566,27 +650,45 @@ pub fn upload_windows_clipboard_files(
         let sftp = session.sftp().map_err(to_error)?;
         let mut responses = Vec::new();
 
-        for local_path in local_paths {
-            if !local_path.is_file() {
-                continue;
-            }
+        for item in clipboard_items {
+            let (sanitized_name, payload, message) = match item {
+                windows_clipboard::ClipboardItem::LocalFile(local_path) => {
+                    if !local_path.is_file() {
+                        continue;
+                    }
 
-            let filename = local_path
-                .file_name()
-                .and_then(|value| value.to_str())
-                .ok_or_else(|| format!("本地文件名非法，没法上传：{}", local_path.display()))?;
-            let sanitized_name = sanitize_upload_filename(filename)?;
-            let payload = std::fs::read(&local_path)
-                .map_err(|error| format!("读取本地文件 `{}` 失败: {error}", local_path.display()))?;
+                    let filename = local_path
+                        .file_name()
+                        .and_then(|value| value.to_str())
+                        .ok_or_else(|| format!("本地文件名非法，没法上传：{}", local_path.display()))?;
+                    let sanitized_name = sanitize_upload_filename(filename)?;
+                    let payload = std::fs::read(&local_path).map_err(|error| {
+                        format!("读取本地文件 `{}` 失败: {error}", local_path.display())
+                    })?;
+                    (
+                        sanitized_name,
+                        payload,
+                        format!("已从 Windows 剪贴板上传 `{filename}` 到 `{remote_dir}`"),
+                    )
+                }
+                windows_clipboard::ClipboardItem::Image { filename, payload } => {
+                    let sanitized_name = sanitize_upload_filename(&filename)?;
+                    (
+                        sanitized_name,
+                        payload,
+                        format!("已从 Windows 剪贴板上传图片 `{filename}` 到 `{remote_dir}`"),
+                    )
+                }
+            };
+
             let remote_path = join_remote_path(&remote_dir, &sanitized_name);
-
             write_remote_payload(&sftp, &remote_path, &payload)?;
             remember_recent_file(&state, &remote_path)?;
 
             responses.push(UploadResponse {
                 path: remote_path,
                 bytes_written: payload.len(),
-                message: format!("已从 Windows 剪贴板上传 `{sanitized_name}` 到 `{remote_dir}`"),
+                message,
             });
         }
 
@@ -889,20 +991,64 @@ fn unique_local_destination(initial: PathBuf) -> PathBuf {
     initial
 }
 
-fn create_authenticated_session(request: &ConnectRequest) -> Result<Session, String> {
-    let tcp = TcpStream::connect(format!("{}:{}", request.host, request.port))
-        .map_err(|error| format!("TCP 连接失败: {error}"))?;
-    tcp.set_read_timeout(Some(Duration::from_secs(15)))
-        .map_err(|error| error.to_string())?;
-    tcp.set_write_timeout(Some(Duration::from_secs(15)))
-        .map_err(|error| error.to_string())?;
+fn create_authenticated_session(app: &AppHandle, request: &ConnectRequest) -> Result<Session, String> {
+    create_authenticated_session_inner(request, Some(app))
+}
+
+fn create_authenticated_session_silent(request: &ConnectRequest) -> Result<Session, String> {
+    create_authenticated_session_inner(request, None)
+}
+
+fn create_authenticated_session_inner(
+    request: &ConnectRequest,
+    app: Option<&AppHandle>,
+) -> Result<Session, String> {
+    let tcp = connect_tcp_stream(request)?;
+    tcp.set_read_timeout(Some(SSH_IO_TIMEOUT))
+        .map_err(|error| format!("设置 TCP 读取超时失败: {error}"))?;
+    tcp.set_write_timeout(Some(SSH_IO_TIMEOUT))
+        .map_err(|error| format!("设置 TCP 写入超时失败: {error}"))?;
+
+    if let Some(app) = app {
+        emit_connection_progress(
+            app,
+            ConnectionProgress {
+                stage: "handshake".into(),
+                message: "正在进行 SSH 握手...".into(),
+                detail: Some(
+                    "这一步卡住通常是服务端没响应、被防火墙拦了，或者网络质量太烂。".into(),
+                ),
+                current_step: 2,
+                total_steps: CONNECT_TOTAL_STEPS,
+                is_error: false,
+            },
+        );
+    }
 
     let mut session = Session::new().map_err(to_error)?;
+    session.set_timeout(SSH_IO_TIMEOUT.as_millis() as u32);
     session.set_tcp_stream(tcp);
-    session.handshake().map_err(to_error)?;
+    session
+        .handshake()
+        .map_err(|error| explain_ssh_handshake_error(&request.host, request.port, error))?;
+
+    if let Some(app) = app {
+        emit_connection_progress(
+            app,
+            ConnectionProgress {
+                stage: "auth".into(),
+                message: "正在验证用户名和密码...".into(),
+                detail: Some(format!("登录用户：{}", request.username)),
+                current_step: 3,
+                total_steps: CONNECT_TOTAL_STEPS,
+                is_error: false,
+            },
+        );
+    }
+
     session
         .userauth_password(&request.username, &request.password)
-        .map_err(to_error)?;
+        .map_err(|error| explain_ssh_auth_error(&request.username, error))?;
 
     if !session.authenticated() {
         return Err("SSH 鉴权失败，请检查账号密码。".into());
@@ -918,11 +1064,12 @@ fn resolve_home_path(session: &Session) -> Result<String, String> {
 }
 
 fn resolve_remote_identity(session: &Session) -> Result<(Option<u32>, Vec<u32>), String> {
-    let uid_output = run_remote_command(session, "id -u")?;
-    let group_output = run_remote_command(session, "id -G")?;
-
-    let user_uid = uid_output.trim().parse::<u32>().ok();
-    let group_ids = group_output
+    let output = run_remote_command(session, "id -u; id -G")?;
+    let mut lines = output.lines();
+    let user_uid = lines.next().and_then(|value| value.trim().parse::<u32>().ok());
+    let group_ids = lines
+        .next()
+        .unwrap_or_default()
         .split_whitespace()
         .filter_map(|item| item.trim().parse::<u32>().ok())
         .collect::<Vec<_>>();
@@ -1025,7 +1172,7 @@ fn download_remote_directory_recursive(
 }
 
 fn connect_from_stored(connection: &StoredConnection) -> Result<Session, String> {
-    create_authenticated_session(&ConnectRequest {
+    create_authenticated_session_silent(&ConnectRequest {
         name: Some(connection.summary.name.clone()),
         host: connection.host.clone(),
         port: connection.port,
@@ -1049,12 +1196,18 @@ fn detect_language(path: &str) -> Option<String> {
         "typescript"
     } else if lower.ends_with(".js") || lower.ends_with(".mjs") {
         "javascript"
+    } else if lower.ends_with(".html") || lower.ends_with(".htm") {
+        "html"
+    } else if lower.ends_with(".css") || lower.ends_with(".scss") || lower.ends_with(".less") {
+        "css"
     } else if lower.ends_with(".json") {
         "json"
     } else if lower.ends_with(".toml") {
         "toml"
     } else if lower.ends_with(".yml") || lower.ends_with(".yaml") {
         "yaml"
+    } else if lower.ends_with(".xml") || lower.ends_with(".svg") {
+        "xml"
     } else if lower.ends_with(".sh") {
         "shell"
     } else if lower.ends_with(".conf") {
@@ -1252,6 +1405,10 @@ fn map_entry(
 }
 
 fn resolve_entry_access(stat: &FileStat, connection: &StoredConnection) -> (bool, bool, bool) {
+    if connection.user_uid == Some(0) {
+        return (true, true, true);
+    }
+
     let Some(perm) = stat.perm else {
         return (true, true, true);
     };
@@ -1275,8 +1432,92 @@ fn resolve_entry_access(stat: &FileStat, connection: &StoredConnection) -> (bool
     (can_read, can_write, can_enter)
 }
 
+fn connect_tcp_stream(request: &ConnectRequest) -> Result<TcpStream, String> {
+    let address = format!("{}:{}", request.host, request.port);
+    let socket_addrs = address
+        .to_socket_addrs()
+        .map_err(|error| format!("解析主机 `{address}` 失败: {error}"))?
+        .collect::<Vec<_>>();
+
+    if socket_addrs.is_empty() {
+        return Err(format!("主机 `{address}` 没解析出可用地址。"));
+    }
+
+    let mut last_error = None;
+    for socket_addr in socket_addrs {
+        match TcpStream::connect_timeout(&socket_addr, SSH_CONNECT_TIMEOUT) {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    let rendered = last_error
+        .map(|error| explain_tcp_connect_error(&address, error))
+        .unwrap_or_else(|| format!("TCP 连接 `{address}` 失败，底层错误都没吐出来。"));
+    Err(rendered)
+}
+
 fn to_error(error: impl std::fmt::Display) -> String {
     error.to_string()
+}
+
+fn explain_tcp_connect_error(address: &str, error: std::io::Error) -> String {
+    match error.kind() {
+        ErrorKind::TimedOut => format!(
+            "TCP 连接 `{address}` 超时了。{} 秒内连不上，通常是主机不通、防火墙拦截，或者端口压根没开。",
+            SSH_CONNECT_TIMEOUT.as_secs()
+        ),
+        ErrorKind::ConnectionRefused => {
+            format!("TCP 连接 `{address}` 被拒绝。主机在线，但 SSH 服务可能没启动，或者端口写错了。")
+        }
+        ErrorKind::NotFound | ErrorKind::AddrNotAvailable => {
+            format!("TCP 连接 `{address}` 失败：主机地址不可用。")
+        }
+        _ => format!("TCP 连接 `{address}` 失败: {error}"),
+    }
+}
+
+fn explain_ssh_handshake_error(
+    host: &str,
+    port: u16,
+    error: impl std::fmt::Display,
+) -> String {
+    let raw = error.to_string();
+    let lower = raw.to_lowercase();
+
+    if lower.contains("timed out") || lower.contains("timeout") {
+        return format!(
+            "SSH 握手 `{host}:{port}` 超时了。服务端可能太慢、被限流，或者网络已经烂到握手都完不成。原始错误：{raw}"
+        );
+    }
+
+    if lower.contains("banner") {
+        return format!(
+            "SSH 握手 `{host}:{port}` 失败：服务端返回的 SSH banner 不对劲，端口可能根本不是 SSH。原始错误：{raw}"
+        );
+    }
+
+    format!("SSH 握手 `{host}:{port}` 失败: {raw}")
+}
+
+fn explain_ssh_auth_error(username: &str, error: impl std::fmt::Display) -> String {
+    let raw = error.to_string();
+    let lower = raw.to_lowercase();
+
+    if lower.contains("timed out") || lower.contains("timeout") {
+        return format!(
+            "SSH 鉴权超时了，用户 `{username}` 的登录请求没在限定时间内完成。网络慢、服务端负载高，或者安全策略在拖时间。原始错误：{raw}"
+        );
+    }
+
+    if lower.contains("authentication failed")
+        || lower.contains("username/password")
+        || lower.contains("access denied")
+    {
+        return format!("SSH 鉴权失败，用户 `{username}` 的账号或密码不对。原始错误：{raw}");
+    }
+
+    format!("SSH 鉴权失败，用户 `{username}` 登录没过。原始错误：{raw}")
 }
 
 fn humanize_updater_error(error: impl std::fmt::Display) -> String {
@@ -1311,6 +1552,10 @@ fn humanize_updater_error(error: impl std::fmt::Display) -> String {
 
 fn emit_update_progress(app: &AppHandle, payload: AppUpdateProgress) {
     let _ = app.emit("update-progress", payload);
+}
+
+fn emit_connection_progress(app: &AppHandle, payload: ConnectionProgress) {
+    let _ = app.emit("connection-progress", payload);
 }
 
 #[cfg(desktop)]
@@ -1505,19 +1750,27 @@ fn remove_remote_directory_recursive(sftp: &ssh2::Sftp, remote_dir: &Path) -> Re
 mod windows_clipboard {
     use std::{
         ffi::{c_void, OsString},
+        mem,
         os::windows::ffi::OsStringExt,
         path::PathBuf,
         ptr,
+        slice,
+        time::{SystemTime, UNIX_EPOCH},
     };
 
     type Bool = i32;
     type Handle = *mut c_void;
     type Hdrop = Handle;
+    type Hglobal = Handle;
     type Hwnd = *mut c_void;
     type Uint = u32;
+    type SizeT = usize;
 
     const CF_HDROP: Uint = 15;
+    const CF_DIB: Uint = 8;
+    const CF_DIBV5: Uint = 17;
     const FILE_COUNT_QUERY: Uint = 0xFFFF_FFFF;
+    const BI_BITFIELDS: u32 = 3;
 
     #[link(name = "user32")]
     unsafe extern "system" {
@@ -1527,14 +1780,30 @@ mod windows_clipboard {
         fn IsClipboardFormatAvailable(format: Uint) -> Bool;
     }
 
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GlobalLock(memory: Hglobal) -> *mut c_void;
+        fn GlobalUnlock(memory: Hglobal) -> Bool;
+        fn GlobalSize(memory: Hglobal) -> SizeT;
+    }
+
     #[link(name = "shell32")]
     unsafe extern "system" {
         fn DragQueryFileW(drop: Hdrop, index: Uint, file: *mut u16, length: Uint) -> Uint;
     }
 
-    pub fn read_clipboard_file_paths() -> Result<Vec<PathBuf>, String> {
+    pub enum ClipboardItem {
+        LocalFile(PathBuf),
+        Image { filename: String, payload: Vec<u8> },
+    }
+
+    pub fn read_clipboard_items() -> Result<Vec<ClipboardItem>, String> {
         unsafe {
-            if IsClipboardFormatAvailable(CF_HDROP) == 0 {
+            let has_files = IsClipboardFormatAvailable(CF_HDROP) != 0;
+            let has_image =
+                IsClipboardFormatAvailable(CF_DIBV5) != 0 || IsClipboardFormatAvailable(CF_DIB) != 0;
+
+            if !has_files && !has_image {
                 return Ok(Vec::new());
             }
 
@@ -1542,7 +1811,15 @@ mod windows_clipboard {
                 return Err("打开 Windows 剪贴板失败。".into());
             }
 
-            let result = read_drop_file_list();
+            let result = if has_files {
+                read_drop_file_list().map(|paths| {
+                    paths.into_iter()
+                        .map(ClipboardItem::LocalFile)
+                        .collect::<Vec<_>>()
+                })
+            } else {
+                read_bitmap_item().map(|item| item.into_iter().collect::<Vec<_>>())
+            };
             let _ = CloseClipboard();
             result
         }
@@ -1571,5 +1848,125 @@ mod windows_clipboard {
         }
 
         Ok(paths)
+    }
+
+    unsafe fn read_bitmap_item() -> Result<Option<ClipboardItem>, String> {
+        let format = if unsafe { IsClipboardFormatAvailable(CF_DIBV5) } != 0 {
+            CF_DIBV5
+        } else if unsafe { IsClipboardFormatAvailable(CF_DIB) } != 0 {
+            CF_DIB
+        } else {
+            return Ok(None);
+        };
+
+        let handle = unsafe { GetClipboardData(format) };
+        if handle.is_null() {
+            return Ok(None);
+        }
+
+        let size = unsafe { GlobalSize(handle) };
+        if size == 0 {
+            return Err("读取 Windows 剪贴板图片失败：位图数据为空。".into());
+        }
+
+        let pointer = unsafe { GlobalLock(handle) } as *const u8;
+        if pointer.is_null() {
+            return Err("读取 Windows 剪贴板图片失败：无法锁定位图数据。".into());
+        }
+
+        let dib = unsafe { slice::from_raw_parts(pointer, size) }.to_vec();
+        let _ = unsafe { GlobalUnlock(handle) };
+        let payload = build_bmp_file(&dib)?;
+
+        Ok(Some(ClipboardItem::Image {
+            filename: build_clipboard_image_name(),
+            payload,
+        }))
+    }
+
+    fn build_clipboard_image_name() -> String {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        format!("clipboard-{stamp}.bmp")
+    }
+
+    fn build_bmp_file(dib: &[u8]) -> Result<Vec<u8>, String> {
+        if dib.len() < 16 {
+            return Err("读取 Windows 剪贴板图片失败：位图头不完整。".into());
+        }
+
+        let header_size = read_u32_le(dib, 0)? as usize;
+        if header_size < 40 || header_size > dib.len() {
+            return Err("读取 Windows 剪贴板图片失败：位图头格式不支持。".into());
+        }
+
+        let bit_count = read_u16_le(dib, 14)? as usize;
+        let compression = read_u32_le(dib, 16)?;
+        let colors_used = if header_size >= 36 {
+            read_u32_le(dib, 32)? as usize
+        } else {
+            0
+        };
+
+        let mask_bytes = if compression == BI_BITFIELDS && header_size == 40 {
+            12
+        } else {
+            0
+        };
+        let palette_entries = if bit_count <= 8 {
+            if colors_used > 0 {
+                colors_used
+            } else {
+                1usize
+                    .checked_shl(bit_count as u32)
+                    .ok_or_else(|| "读取 Windows 剪贴板图片失败：调色板大小异常。".to_string())?
+            }
+        } else {
+            0
+        };
+        let palette_bytes = palette_entries
+            .checked_mul(mem::size_of::<u32>())
+            .ok_or_else(|| "读取 Windows 剪贴板图片失败：调色板大小异常。".to_string())?;
+        let pixel_offset = 14usize
+            .checked_add(header_size)
+            .and_then(|value| value.checked_add(mask_bytes))
+            .and_then(|value| value.checked_add(palette_bytes))
+            .ok_or_else(|| "读取 Windows 剪贴板图片失败：像素偏移异常。".to_string())?;
+
+        if pixel_offset < 14 || pixel_offset - 14 > dib.len() {
+            return Err("读取 Windows 剪贴板图片失败：位图像素偏移超出范围。".into());
+        }
+
+        let file_size = 14usize
+            .checked_add(dib.len())
+            .ok_or_else(|| "读取 Windows 剪贴板图片失败：位图大小异常。".to_string())?;
+        let file_size_u32 = u32::try_from(file_size)
+            .map_err(|_| "读取 Windows 剪贴板图片失败：位图体积过大。".to_string())?;
+        let pixel_offset_u32 = u32::try_from(pixel_offset)
+            .map_err(|_| "读取 Windows 剪贴板图片失败：位图偏移过大。".to_string())?;
+
+        let mut payload = Vec::with_capacity(file_size);
+        payload.extend_from_slice(b"BM");
+        payload.extend_from_slice(&file_size_u32.to_le_bytes());
+        payload.extend_from_slice(&[0_u8; 4]);
+        payload.extend_from_slice(&pixel_offset_u32.to_le_bytes());
+        payload.extend_from_slice(dib);
+        Ok(payload)
+    }
+
+    fn read_u16_le(bytes: &[u8], offset: usize) -> Result<u16, String> {
+        let chunk = bytes
+            .get(offset..offset + 2)
+            .ok_or_else(|| "读取 Windows 剪贴板图片失败：位图字段越界。".to_string())?;
+        Ok(u16::from_le_bytes([chunk[0], chunk[1]]))
+    }
+
+    fn read_u32_le(bytes: &[u8], offset: usize) -> Result<u32, String> {
+        let chunk = bytes
+            .get(offset..offset + 4)
+            .ok_or_else(|| "读取 Windows 剪贴板图片失败：位图字段越界。".to_string())?;
+        Ok(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
     }
 }

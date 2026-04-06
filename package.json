@@ -1,7 +1,7 @@
 {
   "name": "fshell",
   "private": true,
-  "version": "0.2.3",
+  "version": "0.2.4",
   "type": "module",
   "scripts": {
     "dev": "vite --host 0.0.0.0 --port 1420",
@@ -10,9 +10,11 @@
     "tauri": "tauri"
   },
   "dependencies": {
+    "@monaco-editor/react": "^4.7.0",
     "@tauri-apps/api": "^2.8.0",
     "@xterm/addon-fit": "^0.10.0",
     "@xterm/xterm": "^5.5.0",
+    "monaco-editor": "^0.55.1",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },
@@ -23,5 +25,6 @@
     "@vitejs/plugin-react": "^4.3.4",
     "typescript": "^5.8.2",
     "vite": "^5.4.14"
-  }
+  },
+  "packageManager": "pnpm@10.6.2+sha512.47870716bea1572b53df34ad8647b42962bc790ce2bf4562ba0f643237d7302a3d6a8ecef9e4bdfc01d23af1969aa90485d4cebb0b9638fa5ef1daef656f6c1b"
 }

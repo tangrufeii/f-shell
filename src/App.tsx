@@ -11,10 +11,37 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
+import type { editor as MonacoEditor } from "monaco-editor";
+import {
+  buildConnectionProfile,
+  initialConnectionForm,
+  persistActiveProfileId,
+  persistConnectionDraft,
+  persistConnectionProfiles,
+  profileMatchesForm,
+  readStoredActiveProfileId,
+  readStoredConnectionProfiles,
+  resolveInitialConnectForm,
+  sortConnectionProfiles,
+  toFormFromProfile,
+  upsertConnectionProfile,
+  type ConnectionForm,
+  type ConnectionProfile
+} from "./lib/connectionProfiles";
+import PreviewWorkspace, { PreviewWorkspaceActions } from "./components/PreviewWorkspace";
+import FileActionDialog from "./components/FileActionDialog";
+import AboutUpdateDialog from "./components/AboutUpdateDialog";
+import ConnectDialog from "./components/ConnectDialog";
+import RemoteFileTree from "./components/RemoteFileTree";
+import TerminalToolbar from "./components/TerminalToolbar";
+import TopToolbar from "./components/TopToolbar";
+import TreeContextMenu from "./components/TreeContextMenu";
 import type {
   AppUpdateInfo,
   AppUpdateInstallResponse,
   AppUpdateProgress,
+  CommandHistoryItem,
+  ConnectionProgress,
   ConnectionSummary,
   DownloadResponse,
   FileActionResponse,
@@ -31,7 +58,7 @@ type EntryMap = Record<string, RemoteEntry[]>;
 type ResizeDirection = "East" | "North" | "NorthEast" | "NorthWest" | "South" | "SouthEast" | "SouthWest" | "West";
 type TerminalSearchMatch = { row: number; col: number; length: number };
 type TextSearchMatch = { start: number; end: number };
-type ConnectFieldErrors = Partial<Record<keyof typeof initialForm, string>>;
+type ConnectFieldErrors = Partial<Record<keyof ConnectionForm, string>>;
 type FileActionMode = "new-file" | "new-directory" | "rename" | "delete";
 type FileActionErrors = {
   name?: string;
@@ -63,10 +90,31 @@ type UpdateNoticeState = {
   version?: string | null;
   sticky?: boolean;
 };
+type UpdatePreferences = {
+  autoCheckOnStartup: boolean;
+  showAvailableNoticeOnStartup: boolean;
+};
+type UpdateCheckRecord = {
+  checkedAt: string;
+  outcome: "available" | "latest" | "error";
+  version?: string | null;
+  message: string;
+};
+type SaveFeedbackState = {
+  tone: "success" | "error";
+  message: string;
+};
 
 const COMMAND_HISTORY_STORAGE_KEY = "fshell-command-history";
+const SIDEBAR_WIDTH_STORAGE_KEY = "fshell-sidebar-width";
 const UPDATE_DISMISSED_VERSION_STORAGE_KEY = "fshell-update-dismissed-version";
+const UPDATE_PREFERENCES_STORAGE_KEY = "fshell-update-preferences";
+const UPDATE_LAST_CHECK_STORAGE_KEY = "fshell-update-last-check";
 const COMMAND_HISTORY_LIMIT = 40;
+const DEFAULT_SIDEBAR_WIDTH = 460;
+const MIN_SIDEBAR_WIDTH = 360;
+const MAX_SIDEBAR_WIDTH = 760;
+const NARROW_LAYOUT_BREAKPOINT = 1320;
 const GITHUB_RELEASES_PAGE_URL = "https://github.com/tangrufeii/f-shell/releases";
 const GITHUB_LATEST_JSON_URL = `${GITHUB_RELEASES_PAGE_URL}/latest/download/latest.json`;
 const WINDOW_RESIZE_DIRECTIONS: ResizeDirection[] = [
@@ -80,13 +128,51 @@ const WINDOW_RESIZE_DIRECTIONS: ResizeDirection[] = [
   "SouthWest"
 ];
 
-const initialForm = {
-  name: "我的服务器",
-  host: "127.0.0.1",
-  port: "22",
-  username: "root",
-  password: ""
+const defaultUpdatePreferences: UpdatePreferences = {
+  autoCheckOnStartup: true,
+  showAvailableNoticeOnStartup: true
 };
+
+function clampSidebarWidth(width: number): number {
+  return Math.min(MAX_SIDEBAR_WIDTH, Math.max(MIN_SIDEBAR_WIDTH, Math.round(width)));
+}
+
+function readStoredSidebarWidth(): number {
+  try {
+    const raw = window.localStorage.getItem(SIDEBAR_WIDTH_STORAGE_KEY);
+    if (!raw) {
+      return DEFAULT_SIDEBAR_WIDTH;
+    }
+
+    const value = Number(raw);
+    return Number.isFinite(value) ? clampSidebarWidth(value) : DEFAULT_SIDEBAR_WIDTH;
+  } catch (error) {
+    console.error(error);
+    return DEFAULT_SIDEBAR_WIDTH;
+  }
+}
+
+function resolveEditorLanguage(language: string | null | undefined): string {
+  switch (language) {
+    case "typescript":
+    case "javascript":
+    case "html":
+    case "css":
+    case "xml":
+    case "json":
+    case "yaml":
+    case "markdown":
+    case "rust":
+    case "shell":
+      return language;
+    case "toml":
+      return "ini";
+    case "dotenv":
+      return "shell";
+    default:
+      return "plaintext";
+  }
+}
 
 function parentRemotePath(path: string): string {
   const segments = path.split("/").filter(Boolean);
@@ -146,6 +232,25 @@ function formatUpdatePubDate(value: string | null): string {
   }).format(parsed);
 }
 
+function formatUpdateCheckTime(value: string | null | undefined): string {
+  if (!value) {
+    return "尚未检查";
+  }
+
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return value;
+  }
+
+  return new Intl.DateTimeFormat("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit"
+  }).format(parsed);
+}
+
 function formatUpdateDuration(durationMs: number | null): string {
   if (!durationMs || durationMs <= 0) {
     return "--";
@@ -164,6 +269,59 @@ function clampPercent(value: number | null | undefined): number {
   }
 
   return Math.max(0, Math.min(100, value));
+}
+
+function isUpdateProgressStageActive(stage: string | null | undefined): boolean {
+  return stage === "preparing" || stage === "downloading" || stage === "installing" || stage === "completed";
+}
+
+function readStoredUpdatePreferences(): UpdatePreferences {
+  try {
+    const raw = window.localStorage.getItem(UPDATE_PREFERENCES_STORAGE_KEY);
+    if (!raw) {
+      return defaultUpdatePreferences;
+    }
+
+    const parsed = JSON.parse(raw) as Partial<UpdatePreferences>;
+    return {
+      autoCheckOnStartup: parsed.autoCheckOnStartup ?? defaultUpdatePreferences.autoCheckOnStartup,
+      showAvailableNoticeOnStartup:
+        parsed.showAvailableNoticeOnStartup ?? defaultUpdatePreferences.showAvailableNoticeOnStartup
+    };
+  } catch (error) {
+    console.error(error);
+    return defaultUpdatePreferences;
+  }
+}
+
+function readStoredUpdateCheckRecord(): UpdateCheckRecord | null {
+  try {
+    const raw = window.localStorage.getItem(UPDATE_LAST_CHECK_STORAGE_KEY);
+    if (!raw) {
+      return null;
+    }
+
+    const parsed = JSON.parse(raw) as UpdateCheckRecord;
+    if (!parsed.checkedAt || !parsed.outcome || !parsed.message) {
+      return null;
+    }
+
+    return parsed;
+  } catch (error) {
+    console.error(error);
+    return null;
+  }
+}
+
+function releaseNotesToList(notes: string | null | undefined): string[] {
+  if (!notes) {
+    return [];
+  }
+
+  return notes
+    .split(/\r?\n/)
+    .map((line) => line.trim().replace(/^[-*]\s*/, ""))
+    .filter(Boolean);
 }
 
 function formatPermissions(permissions: number | null): string {
@@ -188,7 +346,7 @@ function entryAccessLabel(entry: RemoteEntry): string {
       return "无权限";
     }
     if (!entry.canWrite) {
-      return "只读目录";
+      return "可能只读";
     }
     return "可访问";
   }
@@ -197,7 +355,7 @@ function entryAccessLabel(entry: RemoteEntry): string {
     return "不可读取";
   }
   if (!entry.canWrite) {
-    return "只读";
+    return "可能只读";
   }
 
   return "可读写";
@@ -216,11 +374,7 @@ function canUploadToEntry(entry: RemoteEntry | null): boolean {
     return true;
   }
 
-  if (entry.isDir) {
-    return entry.canWrite && entry.canEnter;
-  }
-
-  return entry.canWrite;
+  return entry.isDir ? entry.canEnter : true;
 }
 
 function canDownloadEntry(entry: RemoteEntry | null, targetDir: string): boolean {
@@ -232,15 +386,7 @@ function canDownloadEntry(entry: RemoteEntry | null, targetDir: string): boolean
 }
 
 function canManageEntry(entry: RemoteEntry | null): boolean {
-  if (!entry) {
-    return false;
-  }
-
-  if (entry.isDir) {
-    return entry.canWrite && entry.canEnter;
-  }
-
-  return entry.canWrite;
+  return Boolean(entry);
 }
 
 function remotePathBaseName(path: string): string {
@@ -349,13 +495,13 @@ function readFileAsBase64(file: Blob): Promise<string> {
 
     reader.onload = () => {
       if (typeof reader.result !== "string") {
-        reject(new Error("本地文件读取结果不是字符串，WebView 又在发癫。"));
+        reject(new Error("本地文件读取结果异常，请重试。"));
         return;
       }
 
       const [, base64 = ""] = reader.result.split(",", 2);
       if (!base64) {
-        reject(new Error("本地文件转 base64 失败，数据是空的。"));
+        reject(new Error("本地文件编码失败，未读取到有效数据。"));
         return;
       }
 
@@ -398,7 +544,46 @@ function isWindowDragBlockedTarget(target: EventTarget | null): boolean {
   );
 }
 
-function readStoredHistory(): string[] {
+function sanitizeCommandHistoryItem(value: unknown): CommandHistoryItem | null {
+  if (typeof value === "string") {
+    const command = value.trim();
+    if (!command) {
+      return null;
+    }
+
+    return {
+      command,
+      cwd: "/",
+      updatedAt: ""
+    };
+  }
+
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const candidate = value as Partial<CommandHistoryItem>;
+  if (typeof candidate.command !== "string") {
+    return null;
+  }
+
+  const command = candidate.command.trim();
+  if (!command) {
+    return null;
+  }
+
+  return {
+    command,
+    cwd: typeof candidate.cwd === "string" && candidate.cwd.trim() ? candidate.cwd.trim() : "/",
+    updatedAt: typeof candidate.updatedAt === "string" ? candidate.updatedAt : ""
+  };
+}
+
+function sortCommandHistory(history: CommandHistoryItem[]): CommandHistoryItem[] {
+  return [...history].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+}
+
+function readStoredHistory(): CommandHistoryItem[] {
   try {
     const raw = window.localStorage.getItem(COMMAND_HISTORY_STORAGE_KEY);
     if (!raw) {
@@ -410,7 +595,11 @@ function readStoredHistory(): string[] {
       return [];
     }
 
-    return parsed.filter((item): item is string => typeof item === "string" && Boolean(item.trim()));
+    return sortCommandHistory(
+      parsed
+        .map((item) => sanitizeCommandHistoryItem(item))
+        .filter((item): item is CommandHistoryItem => Boolean(item))
+    ).slice(0, COMMAND_HISTORY_LIMIT);
   } catch (error) {
     console.error(error);
     return [];
@@ -426,13 +615,22 @@ function readDismissedUpdateVersion(): string {
   }
 }
 
-function pushCommandHistory(history: string[], command: string): string[] {
+function pushCommandHistory(history: CommandHistoryItem[], command: string, cwd: string): CommandHistoryItem[] {
   const normalized = command.trim();
   if (!normalized) {
     return history;
   }
 
-  return [normalized, ...history.filter((item) => item !== normalized)].slice(0, COMMAND_HISTORY_LIMIT);
+  const normalizedCwd = cwd.trim() || "/";
+  const nextItem: CommandHistoryItem = {
+    command: normalized,
+    cwd: normalizedCwd,
+    updatedAt: new Date().toISOString()
+  };
+
+  return sortCommandHistory(
+    [nextItem, ...history.filter((item) => !(item.command === normalized && item.cwd === normalizedCwd))]
+  ).slice(0, COMMAND_HISTORY_LIMIT);
 }
 
 function collectTextMatches(content: string, query: string): TextSearchMatch[] {
@@ -526,7 +724,7 @@ function isReasonableCommandText(command: string): boolean {
   return /^[\x20-\x7e\u4e00-\u9fff]*$/.test(command);
 }
 
-function validateConnectForm(form: typeof initialForm): ConnectFieldErrors {
+function validateConnectForm(form: ConnectionForm): ConnectFieldErrors {
   const errors: ConnectFieldErrors = {};
   const host = form.host.trim();
   const username = form.username.trim();
@@ -537,7 +735,7 @@ function validateConnectForm(form: typeof initialForm): ConnectFieldErrors {
   if (!host) {
     errors.host = "主机地址不能为空。";
   } else if (/\s/.test(host)) {
-    errors.host = "主机地址里别掺空格。";
+    errors.host = "主机地址不能包含空格。";
   }
 
   if (!portText) {
@@ -551,11 +749,11 @@ function validateConnectForm(form: typeof initialForm): ConnectFieldErrors {
   if (!username) {
     errors.username = "用户名不能为空。";
   } else if (/\s/.test(username)) {
-    errors.username = "用户名里别塞空格。";
+    errors.username = "用户名不能包含空格。";
   }
 
   if (!password) {
-    errors.password = "当前只支持密码登录，密码不能为空。";
+    errors.password = "密码不能为空。";
   }
 
   return errors;
@@ -603,6 +801,29 @@ function fileActionConfirmLabel(mode: FileActionMode, busy: boolean): string {
     return "确认重命名";
   }
   return "确认删除";
+}
+
+function formatConnectionStage(stage: string | null | undefined): string {
+  switch (stage) {
+    case "pending":
+      return "准备连接";
+    case "tcp":
+      return "TCP 连接";
+    case "handshake":
+      return "SSH 握手";
+    case "auth":
+      return "身份验证";
+    case "prepare":
+      return "初始化远端";
+    case "terminal":
+      return "启动终端";
+    case "ready":
+      return "连接完成";
+    case "error":
+      return "连接失败";
+    default:
+      return "等待连接";
+  }
 }
 
 function BrandLogo({ className = "" }: { className?: string }) {
@@ -670,7 +891,13 @@ function BrandLogo({ className = "" }: { className?: string }) {
 
 function App() {
   const appWindowRef = useRef(getCurrentWindow());
-  const [form, setForm] = useState(initialForm);
+  const [form, setForm] = useState<ConnectionForm>(() => resolveInitialConnectForm());
+  const [connectionProfiles, setConnectionProfiles] = useState<ConnectionProfile[]>(() => readStoredConnectionProfiles());
+  const [activeProfileId, setActiveProfileId] = useState(() => readStoredActiveProfileId());
+  const [profileSearchQuery, setProfileSearchQuery] = useState("");
+  const [sidebarWidth, setSidebarWidth] = useState(() => readStoredSidebarWidth());
+  const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth);
+  const [isSidebarResizing, setIsSidebarResizing] = useState(false);
   const [overview, setOverview] = useState<ShellOverview | null>(null);
   const [connection, setConnection] = useState<ConnectionSummary | null>(null);
   const [currentPath, setCurrentPath] = useState("");
@@ -680,7 +907,7 @@ function App() {
   const [previewError, setPreviewError] = useState("");
   const [editorContent, setEditorContent] = useState("");
   const [selectedEntry, setSelectedEntry] = useState<RemoteEntry | null>(null);
-  const [statusLine, setStatusLine] = useState("等待建立真实 SSH 会话");
+  const [statusLine, setStatusLine] = useState("等待连接");
   const [isConnecting, setIsConnecting] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [isListing, setIsListing] = useState(false);
@@ -698,14 +925,19 @@ function App() {
   const [isCheckingUpdate, setIsCheckingUpdate] = useState(false);
   const [isInstallingUpdate, setIsInstallingUpdate] = useState(false);
   const [updateCheckDurationMs, setUpdateCheckDurationMs] = useState<number | null>(null);
+  const [updatePreferences, setUpdatePreferences] = useState<UpdatePreferences>(() => readStoredUpdatePreferences());
+  const [lastUpdateCheck, setLastUpdateCheck] = useState<UpdateCheckRecord | null>(() => readStoredUpdateCheckRecord());
   const [connectError, setConnectError] = useState("");
+  const [connectionProgress, setConnectionProgress] = useState<ConnectionProgress | null>(null);
   const [connectFieldErrors, setConnectFieldErrors] = useState<ConnectFieldErrors>({});
+  const [saveFeedback, setSaveFeedback] = useState<SaveFeedbackState | null>(null);
   const [treeContextMenu, setTreeContextMenu] = useState<TreeContextMenuState | null>(null);
   const [fileActionDialog, setFileActionDialog] = useState<FileActionDialogState | null>(null);
-  const [commandHistory, setCommandHistory] = useState<string[]>(() => readStoredHistory());
+  const [commandHistory, setCommandHistory] = useState<CommandHistoryItem[]>(() => readStoredHistory());
   const [historySelection, setHistorySelection] = useState("");
   const [commandDraft, setCommandDraft] = useState("");
   const [isHistoryMenuOpen, setIsHistoryMenuOpen] = useState(false);
+  const [isSavedProfilesMenuOpen, setIsSavedProfilesMenuOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResultCount, setSearchResultCount] = useState(0);
   const [searchActiveIndex, setSearchActiveIndex] = useState(0);
@@ -715,15 +947,18 @@ function App() {
   const fitAddonRef = useRef<FitAddon | null>(null);
   const hasConnectionRef = useRef(false);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
-  const editorRef = useRef<HTMLTextAreaElement | null>(null);
+  const editorRef = useRef<MonacoEditor.IStandaloneCodeEditor | null>(null);
   const historyMenuRef = useRef<HTMLDivElement | null>(null);
+  const savedProfilesMenuRef = useRef<HTMLDivElement | null>(null);
   const treeContextMenuRef = useRef<HTMLDivElement | null>(null);
   const fileActionInputRef = useRef<HTMLInputElement | null>(null);
+  const sidebarResizeStateRef = useRef<{ startX: number; startWidth: number } | null>(null);
   const currentInputBufferRef = useRef("");
   const terminalSearchMatchesRef = useRef<TerminalSearchMatch[]>([]);
   const previewSearchMatchesRef = useRef<TextSearchMatch[]>([]);
   const pendingTerminalDraftSyncRef = useRef(false);
   const hasAutoUpdateCheckRef = useRef(false);
+  const isNarrowWorkbench = viewportWidth <= NARROW_LAYOUT_BREAKPOINT;
 
   useEffect(() => {
     void bootstrap();
@@ -772,8 +1007,100 @@ function App() {
   }, [commandHistory]);
 
   useEffect(() => {
+    persistConnectionDraft(form);
+  }, [form]);
+
+  useEffect(() => {
+    persistConnectionProfiles(connectionProfiles);
+  }, [connectionProfiles]);
+
+  useEffect(() => {
+    persistActiveProfileId(activeProfileId);
+  }, [activeProfileId]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(SIDEBAR_WIDTH_STORAGE_KEY, String(sidebarWidth));
+    } catch (error) {
+      console.error(error);
+    }
+  }, [sidebarWidth]);
+
+  useEffect(() => {
+    const handleResize = () => {
+      setViewportWidth(window.innerWidth);
+    };
+
+    window.addEventListener("resize", handleResize);
+    return () => {
+      window.removeEventListener("resize", handleResize);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isSidebarResizing) {
+      return;
+    }
+
+    const handleMouseMove = (event: MouseEvent) => {
+      const resizeState = sidebarResizeStateRef.current;
+      if (!resizeState) {
+        return;
+      }
+
+      setSidebarWidth(clampSidebarWidth(resizeState.startWidth + event.clientX - resizeState.startX));
+    };
+
+    const stopSidebarResize = () => {
+      sidebarResizeStateRef.current = null;
+      setIsSidebarResizing(false);
+      document.body.classList.remove("sidebar-resizing");
+    };
+
+    document.body.classList.add("sidebar-resizing");
+    window.addEventListener("mousemove", handleMouseMove);
+    window.addEventListener("mouseup", stopSidebarResize);
+    window.addEventListener("blur", stopSidebarResize);
+
+    return () => {
+      window.removeEventListener("mousemove", handleMouseMove);
+      window.removeEventListener("mouseup", stopSidebarResize);
+      window.removeEventListener("blur", stopSidebarResize);
+      document.body.classList.remove("sidebar-resizing");
+    };
+  }, [isSidebarResizing]);
+
+  useEffect(() => {
+    if (!isNarrowWorkbench) {
+      return;
+    }
+
+    sidebarResizeStateRef.current = null;
+    setIsSidebarResizing(false);
+    document.body.classList.remove("sidebar-resizing");
+  }, [isNarrowWorkbench]);
+
+  useEffect(() => {
+    if (!saveFeedback) {
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      setSaveFeedback((previous) => (previous === saveFeedback ? null : previous));
+    }, 2600);
+
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [saveFeedback]);
+
+  useEffect(() => {
     const handlePointerDown = (event: MouseEvent) => {
       if (historyMenuRef.current && historyMenuRef.current.contains(event.target as Node)) {
+        return;
+      }
+
+      if (savedProfilesMenuRef.current && savedProfilesMenuRef.current.contains(event.target as Node)) {
         return;
       }
 
@@ -782,6 +1109,7 @@ function App() {
       }
 
       setIsHistoryMenuOpen(false);
+      setIsSavedProfilesMenuOpen(false);
       setTreeContextMenu(null);
     };
 
@@ -797,6 +1125,7 @@ function App() {
         setTreeContextMenu(null);
         setFileActionDialog(null);
         setIsAboutDialogOpen(false);
+        setIsSavedProfilesMenuOpen(false);
         if (updateNotice?.kind !== "progress") {
           setUpdateNotice(null);
         }
@@ -839,6 +1168,26 @@ function App() {
       window.clearTimeout(timer);
     };
   }, [updateNotice]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(UPDATE_PREFERENCES_STORAGE_KEY, JSON.stringify(updatePreferences));
+    } catch (error) {
+      console.error(error);
+    }
+  }, [updatePreferences]);
+
+  useEffect(() => {
+    if (!lastUpdateCheck) {
+      return;
+    }
+
+    try {
+      window.localStorage.setItem(UPDATE_LAST_CHECK_STORAGE_KEY, JSON.stringify(lastUpdateCheck));
+    } catch (error) {
+      console.error(error);
+    }
+  }, [lastUpdateCheck]);
 
   useEffect(() => {
     let unlistenUpdateProgress: (() => void) | undefined;
@@ -903,7 +1252,28 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (!appVersion || hasAutoUpdateCheckRef.current) {
+    let unlistenConnectionProgress: (() => void) | undefined;
+
+    void listen<ConnectionProgress>("connection-progress", (event) => {
+      const payload = event.payload;
+      setConnectionProgress(payload);
+      setStatusLine(payload.detail || payload.message);
+      if (payload.isError) {
+        setConnectError(payload.detail || payload.message);
+      } else if (payload.stage === "ready") {
+        setConnectError("");
+      }
+    }).then((fn) => {
+      unlistenConnectionProgress = fn;
+    });
+
+    return () => {
+      unlistenConnectionProgress?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!appVersion || hasAutoUpdateCheckRef.current || !updatePreferences.autoCheckOnStartup) {
       return;
     }
 
@@ -915,7 +1285,7 @@ function App() {
     return () => {
       window.clearTimeout(timer);
     };
-  }, [appVersion]);
+  }, [appVersion, updatePreferences.autoCheckOnStartup]);
 
   useEffect(() => {
     if (activeWorkspace !== "terminal") {
@@ -992,18 +1362,27 @@ function App() {
         return;
       }
 
-      const files = extractTransferFiles(event.clipboardData);
+      const clipboardData = event.clipboardData;
+      const files = extractTransferFiles(clipboardData);
+      const text = clipboardData?.getData("text/plain") ?? "";
+      const targetDir = currentPath || connection.homePath || "/";
+      const terminalTarget = isTerminalInputTarget(event.target);
+
       if (!files.length) {
-        if (!isTextEditableTarget(event.target)) {
+        if (terminalTarget && text) {
           event.preventDefault();
-          const targetDir = currentPath || connection.homePath || "/";
-          void uploadWindowsClipboardFiles(targetDir);
+          void pasteTextToTerminal(text);
+          return;
+        }
+
+        if (!text && !isTextEditableTarget(event.target)) {
+          event.preventDefault();
+          void uploadWindowsClipboardFiles(targetDir, { fillTerminalPaths: terminalTarget });
         }
         return;
       }
 
       event.preventDefault();
-      const targetDir = currentPath || connection.homePath || "/";
       void uploadFiles(files, targetDir, "剪贴板");
     };
 
@@ -1178,34 +1557,147 @@ function App() {
     }
   }
 
-  async function connect() {
-    const errors = validateConnectForm(form);
+  function updateConnectField<Key extends keyof ConnectionForm>(field: Key, value: ConnectionForm[Key]) {
+    setForm((previous) => ({ ...previous, [field]: value }));
+    setConnectError("");
+    setConnectFieldErrors((previous) => ({ ...previous, [field]: undefined }));
+  }
+
+  function resolveCurrentProfileId() {
+    if (activeProfileId) {
+      return activeProfileId;
+    }
+
+    return connectionProfiles.find((item) => profileMatchesForm(item, form))?.id ?? "";
+  }
+
+  function saveCurrentConnectionProfile(options?: {
+    silent?: boolean;
+    formOverride?: ConnectionForm;
+    profileIdOverride?: string;
+  }) {
+    const sourceForm = options?.formOverride ?? form;
+    const errors = validateConnectForm(sourceForm);
+    setConnectFieldErrors(errors);
+    if (Object.keys(errors).length > 0) {
+      if (!options?.silent) {
+        setStatusLine("请先补全后再保存配置。");
+      }
+      return "";
+    }
+
+    const currentProfileId = options?.profileIdOverride ?? resolveCurrentProfileId();
+    const existingProfile = connectionProfiles.find((item) => item.id === currentProfileId);
+    const profile = {
+      ...buildConnectionProfile(sourceForm, currentProfileId || undefined),
+      pinned: existingProfile?.pinned ?? false,
+      lastUsedAt: existingProfile?.lastUsedAt ?? null
+    };
+    setConnectionProfiles((previous) => upsertConnectionProfile(previous, profile));
+    setActiveProfileId(profile.id);
+    if (options?.formOverride) {
+      setForm(toFormFromProfile(profile, sourceForm.password));
+    }
+    if (!options?.silent) {
+      setStatusLine(`已保存配置：${profile.name}`);
+    }
+    return profile.id;
+  }
+
+  function applyConnectionProfile(profile: ConnectionProfile) {
+    setForm(toFormFromProfile(profile));
+    setActiveProfileId(profile.id);
+    setConnectError("");
+    setConnectFieldErrors({});
+    setConnectionProgress(null);
+    setStatusLine(`已载入配置：${profile.name}`);
+  }
+
+  function removeConnectionProfile(profileId: string) {
+    const profile = connectionProfiles.find((item) => item.id === profileId);
+    const remaining = connectionProfiles.filter((item) => item.id !== profileId);
+    setConnectionProfiles(remaining);
+
+    if (activeProfileId === profileId) {
+      setActiveProfileId(remaining[0]?.id ?? "");
+      if (remaining[0]) {
+        setForm(toFormFromProfile(remaining[0]));
+      }
+    }
+
+    setStatusLine(profile ? `已删除配置：${profile.name}` : "已删除配置。");
+  }
+
+  function markConnectionProfileUsed(profileId: string) {
+    const usedAt = new Date().toISOString();
+    setConnectionProfiles((previous) =>
+      sortConnectionProfiles(
+        previous.map((item) =>
+          item.id === profileId
+            ? {
+                ...item,
+                lastUsedAt: usedAt,
+                updatedAt: usedAt
+              }
+            : item
+        )
+      )
+    );
+  }
+
+  function toggleConnectionProfilePin(profileId: string) {
+    setConnectionProfiles((previous) =>
+      sortConnectionProfiles(
+        previous.map((item) =>
+          item.id === profileId
+            ? {
+                ...item,
+                pinned: !item.pinned
+              }
+            : item
+        )
+      )
+    );
+  }
+
+  async function connect(options?: { formOverride?: ConnectionForm; profileIdOverride?: string }) {
+    const sourceForm = options?.formOverride ?? form;
+    const errors = validateConnectForm(sourceForm);
     setConnectFieldErrors(errors);
     setConnectError("");
 
     if (Object.keys(errors).length > 0) {
-      setStatusLine("连接信息没填对，先把表单错误修掉。");
+      setStatusLine("请先修正连接信息。");
       return;
     }
 
+    setConnectionProgress({
+      stage: "pending",
+      message: "正在提交连接请求...",
+      detail: "马上开始建立 TCP 连接。",
+      currentStep: 0,
+      totalSteps: 5,
+      isError: false
+    });
     setIsConnecting(true);
     try {
       terminalRef.current?.clear();
-      terminalRef.current?.writeln(`Connecting to ${form.username}@${form.host}:${form.port} ...`);
+      terminalRef.current?.writeln(`Connecting to ${sourceForm.username}@${sourceForm.host}:${sourceForm.port} ...`);
 
       const result = await invoke<ConnectionSummary>("connect_ssh", {
         request: {
-          name: form.name.trim() || undefined,
-          host: form.host.trim(),
-          port: Number(form.port),
-          username: form.username.trim(),
-          password: form.password,
+          name: sourceForm.name.trim() || undefined,
+          host: sourceForm.host.trim(),
+          port: Number(sourceForm.port),
+          username: sourceForm.username.trim(),
+          password: sourceForm.password,
           cols: terminalRef.current?.cols ?? 120,
           rows: terminalRef.current?.rows ?? 32
         }
       });
 
       setConnection(result);
+      setForm(sourceForm);
       clearRemoteBrowserState();
       currentInputBufferRef.current = "";
       setCommandDraft("");
@@ -1214,8 +1706,29 @@ function App() {
       setStatusLine(`已连接 ${result.host}`);
       setActiveWorkspace("terminal");
       setIsConnectModalOpen(false);
+      setIsSavedProfilesMenuOpen(false);
       setConnectError("");
       setConnectFieldErrors({});
+      const savedProfileId = saveCurrentConnectionProfile({
+        silent: true,
+        formOverride: sourceForm,
+        profileIdOverride: options?.profileIdOverride
+      });
+      if (savedProfileId) {
+        markConnectionProfileUsed(savedProfileId);
+      }
+      setConnectionProgress((previous) =>
+        previous
+          ? {
+              ...previous,
+              stage: "ready",
+              message: `已连接到 ${result.host}`,
+              detail: previous.detail || "连接链路已经准备好。",
+              currentStep: previous.totalSteps || 5,
+              isError: false
+            }
+          : previous
+      );
       await loadDirectory("/");
       fitAddonRef.current?.fit();
       if (terminalRef.current) {
@@ -1234,6 +1747,14 @@ function App() {
       clearRemoteBrowserState();
       setStatusLine(message);
       setConnectError(message);
+      setConnectionProgress((previous) => ({
+        stage: "error",
+        message: "SSH 连接失败",
+        detail: previous?.detail && previous.detail !== message ? `${previous.detail}\n${message}` : message,
+        currentStep: previous?.currentStep ?? 0,
+        totalSteps: previous?.totalSteps ?? 5,
+        isError: true
+      }));
       terminalRef.current?.writeln(`\r\n[connect error] ${message}`);
       const refreshed = await invoke<ShellOverview>("get_shell_overview");
       setOverview(refreshed);
@@ -1242,9 +1763,17 @@ function App() {
     }
   }
 
+  async function connectWithProfile(profile: ConnectionProfile) {
+    await connect({
+      formOverride: toFormFromProfile(profile),
+      profileIdOverride: profile.id
+    });
+  }
+
   async function disconnect() {
     await invoke("disconnect_ssh");
     setConnection(null);
+    setConnectionProgress(null);
     clearRemoteBrowserState();
     currentInputBufferRef.current = "";
     setCommandDraft("");
@@ -1347,7 +1876,8 @@ function App() {
   }
 
   function rememberCommand(command: string) {
-    setCommandHistory((previous) => pushCommandHistory(previous, command));
+    const cwd = currentPath || connection?.homePath || "/";
+    setCommandHistory((previous) => pushCommandHistory(previous, command, cwd));
     setHistorySelection(command.trim());
   }
 
@@ -1365,6 +1895,7 @@ function App() {
     setPreview(null);
     setPreviewError("");
     setEditorContent("");
+    editorRef.current = null;
     setSelectedEntry(null);
     setCurrentPath("");
     setDragTargetPath("");
@@ -1444,13 +1975,35 @@ function App() {
   }
 
   function focusPreviewSearchMatch(index: number) {
-    const textarea = editorRef.current;
+    const editor = editorRef.current;
     const match = previewSearchMatchesRef.current[index];
-    if (!textarea || !match) {
+    const model = editor?.getModel();
+    if (!editor || !model || !match) {
       return;
     }
 
-    textarea.setSelectionRange(match.start, match.end);
+    const start = model.getPositionAt(match.start);
+    const end = model.getPositionAt(match.end);
+    editor.setSelection({
+      startLineNumber: start.lineNumber,
+      startColumn: start.column,
+      endLineNumber: end.lineNumber,
+      endColumn: end.column
+    });
+    editor.revealRangeInCenter({
+      startLineNumber: start.lineNumber,
+      startColumn: start.column,
+      endLineNumber: end.lineNumber,
+      endColumn: end.column
+    });
+    editor.focus();
+  }
+
+  function handleEditorMount(editor: MonacoEditor.IStandaloneCodeEditor) {
+    editorRef.current = editor;
+    if (searchQuery.trim() && preview?.kind === "Text" && previewSearchMatchesRef.current.length) {
+      focusPreviewSearchMatch(searchActiveIndex);
+    }
   }
 
   function jumpSearch(step: number) {
@@ -1466,13 +2019,13 @@ function App() {
 
   async function fillTerminalCommand(command: string) {
     if (!connection) {
-      setStatusLine("SSH 都没连上，还发什么命令。");
+      setStatusLine("请先连接 SSH。");
       return;
     }
 
     const normalized = command.replace(/\r?\n/g, " ").trim();
     if (!normalized) {
-      setStatusLine("命令栏是空的，别让我对空气执行。");
+      setStatusLine("请输入要执行的命令。");
       return;
     }
 
@@ -1493,7 +2046,7 @@ function App() {
 
   async function executeTerminalCommand() {
     if (!connection) {
-      setStatusLine("SSH 都没连上，还执行个鬼。");
+      setStatusLine("请先连接 SSH。");
       return;
     }
 
@@ -1517,7 +2070,7 @@ function App() {
 
   async function clearCurrentCommand() {
     if (!connection) {
-      setStatusLine("SSH 都没连上，清当前行没意义。");
+      setStatusLine("请先连接 SSH。");
       return;
     }
 
@@ -1535,7 +2088,7 @@ function App() {
 
   async function requestTabCompletion() {
     if (!connection) {
-      setStatusLine("SSH 都没连上，补全个锤子。");
+      setStatusLine("请先连接 SSH。");
       return;
     }
 
@@ -1553,7 +2106,7 @@ function App() {
 
   async function clearTerminal() {
     if (!connection) {
-      setStatusLine("先连上终端，清屏才有意义。");
+      setStatusLine("请先连接 SSH。");
       return;
     }
 
@@ -1578,6 +2131,16 @@ function App() {
     terminalSearchMatchesRef.current = [];
     previewSearchMatchesRef.current = [];
     terminalRef.current?.clearSelection();
+    const editor = editorRef.current;
+    const position = editor?.getPosition();
+    if (editor && position) {
+      editor.setSelection({
+        startLineNumber: position.lineNumber,
+        startColumn: position.column,
+        endLineNumber: position.lineNumber,
+        endColumn: position.column
+      });
+    }
   }
 
   async function minimizeWindow() {
@@ -1633,9 +2196,39 @@ function App() {
     setUpdateNotice(null);
   }
 
+  function clearDismissedUpdateVersion() {
+    try {
+      window.localStorage.removeItem(UPDATE_DISMISSED_VERSION_STORAGE_KEY);
+      setStatusLine("已清除“下次再说”的忽略版本记录");
+    } catch (error) {
+      console.error(error);
+      setStatusLine(`清除忽略版本失败: ${String(error)}`);
+    }
+  }
+
+  function updatePreference<K extends keyof UpdatePreferences>(key: K, value: UpdatePreferences[K]) {
+    setUpdatePreferences((previous) => ({
+      ...previous,
+      [key]: value
+    }));
+  }
+
+  function recordUpdateCheck(outcome: UpdateCheckRecord["outcome"], message: string, version?: string | null) {
+    setLastUpdateCheck({
+      checkedAt: new Date().toISOString(),
+      outcome,
+      version: version ?? null,
+      message
+    });
+  }
+
   function openUpdateNotice(result: AppUpdateInfo, reason: "startup" | "manual") {
     const dismissedVersion = readDismissedUpdateVersion();
     if (reason === "startup" && dismissedVersion && dismissedVersion === result.version) {
+      return;
+    }
+
+    if (reason === "startup" && !updatePreferences.showAvailableNoticeOnStartup) {
       return;
     }
 
@@ -1671,10 +2264,12 @@ function App() {
       }
       if (result.available && result.version) {
         setUpdateProgress(null);
+        recordUpdateCheck("available", result.message, result.version);
         openUpdateNotice(result, reason);
         return;
       }
 
+      recordUpdateCheck("latest", result.message, result.currentVersion);
       if (!options?.silentNoUpdate) {
         setUpdateNotice({
           kind: "latest",
@@ -1690,6 +2285,7 @@ function App() {
       console.error(error);
       const message = `检查更新失败: ${String(error)}`;
       setUpdateCheckDurationMs(window.performance.now() - startedAt);
+      recordUpdateCheck("error", message, updateInfo?.version ?? appVersion ?? null);
       if (reason === "manual") {
         setStatusLine(message);
       }
@@ -1714,6 +2310,14 @@ function App() {
     }
 
     setIsInstallingUpdate(true);
+    setUpdateProgress({
+      stage: "preparing",
+      message: "正在确认远端版本、签名和下载地址...",
+      version: updateInfo?.version ?? null,
+      downloadedBytes: null,
+      totalBytes: null,
+      progressPercent: null
+    });
     setUpdateNotice({
       kind: "progress",
       tone: "info",
@@ -1739,6 +2343,14 @@ function App() {
       console.error(error);
       const message = `安装更新失败: ${String(error)}`;
       setStatusLine(message);
+      setUpdateProgress({
+        stage: "idle",
+        message,
+        version: updateInfo?.version ?? null,
+        downloadedBytes: null,
+        totalBytes: null,
+        progressPercent: null
+      });
       setUpdateNotice({
         kind: "error",
         tone: "error",
@@ -1788,7 +2400,7 @@ function App() {
   }
 
   async function savePreview() {
-    if (!preview || preview.kind !== "Text") {
+    if (!preview || preview.kind !== "Text" || isSaving) {
       return;
     }
 
@@ -1799,11 +2411,24 @@ function App() {
         content: editorContent
       });
       setStatusLine(result.message);
+      setSaveFeedback({
+        tone: "success",
+        message: `已保存 ${new Date().toLocaleTimeString("zh-CN", {
+          hour: "2-digit",
+          minute: "2-digit",
+          second: "2-digit"
+        })}`
+      });
       const refreshed = await invoke<ShellOverview>("get_shell_overview");
       setOverview(refreshed);
     } catch (error) {
       console.error(error);
-      setStatusLine(String(error));
+      const message = String(error);
+      setStatusLine(message);
+      setSaveFeedback({
+        tone: "error",
+        message: "保存失败"
+      });
     } finally {
       setIsSaving(false);
     }
@@ -1811,7 +2436,7 @@ function App() {
 
   async function uploadFiles(files: File[], targetDir: string, source: string) {
     if (!connection) {
-      setStatusLine("先连上 SSH，再谈上传。");
+      setStatusLine("请先连接 SSH。");
       return;
     }
 
@@ -1858,7 +2483,7 @@ function App() {
     }
   }
 
-  async function uploadWindowsClipboardFiles(targetDir: string) {
+  async function uploadWindowsClipboardFiles(targetDir: string, options?: { fillTerminalPaths?: boolean }) {
     if (!connection) {
       return;
     }
@@ -1873,13 +2498,26 @@ function App() {
       });
 
       if (!results.length) {
-        setStatusLine("剪贴板里没拿到可上传的本地文件。截图粘贴走浏览器通道，Explorer 复制文件走原生通道。");
+        setStatusLine("剪贴板中没有可上传的文件或图片。");
         return;
       }
 
       const firstImagePath = results.find((item) => isImagePreviewPath(item.path))?.path ?? "";
-      setStatusLine(results[results.length - 1]?.message ?? `已上传到 ${targetDir}`);
       await loadDirectory(targetDir);
+
+      if (options?.fillTerminalPaths) {
+        const pastedPaths = results.map((item) => shellEscapePath(item.path)).join(" ");
+        if (pastedPaths) {
+          await invoke("send_terminal_input", { data: pastedPaths });
+          trackTerminalInput(pastedPaths);
+          setActiveWorkspace("terminal");
+          terminalRef.current?.focus();
+          setStatusLine(`已上传剪贴板内容到 ${targetDir}，并填入终端路径`);
+          return;
+        }
+      }
+
+      setStatusLine(results[results.length - 1]?.message ?? `已上传到 ${targetDir}`);
 
       if (firstImagePath) {
         await openPreview(firstImagePath);
@@ -1896,9 +2534,32 @@ function App() {
     }
   }
 
+  async function pasteTextToTerminal(text: string) {
+    if (!connection) {
+      setStatusLine("请先连接 SSH。");
+      return;
+    }
+
+    if (!text) {
+      setStatusLine("剪贴板里没有可粘贴的文本。");
+      return;
+    }
+
+    try {
+      await invoke("send_terminal_input", { data: text });
+      trackTerminalInput(text);
+      setActiveWorkspace("terminal");
+      setStatusLine("已粘贴剪贴板内容到终端");
+      terminalRef.current?.focus();
+    } catch (error) {
+      console.error(error);
+      setStatusLine(`终端粘贴失败: ${String(error)}`);
+    }
+  }
+
   async function pasteClipboard() {
     if (!preview || preview.kind !== "Text") {
-      setStatusLine("这里现在不是文本编辑器。文件或截图直接 Ctrl+V，会走上传。");
+      setStatusLine("当前区域不支持文本粘贴。");
       return;
     }
 
@@ -1941,7 +2602,28 @@ function App() {
       return true;
     }
 
-    return targetEntry.isDir && targetEntry.canWrite && targetEntry.canEnter;
+    return targetEntry.isDir && targetEntry.canEnter;
+  }
+
+  function openFileActionDialogForTarget(mode: FileActionMode, targetDir: string, entry: RemoteEntry | null) {
+    const initialName = mode === "rename" ? entry?.name ?? "" : "";
+    const dangerText =
+      mode === "delete"
+        ? entry?.isDir
+          ? "会递归删除整个目录，里面的文件也一起没了。"
+          : "删除后无法恢复，请确认。"
+        : "";
+
+    setFileActionDialog({
+      mode,
+      targetDir,
+      entry,
+      name: initialName,
+      errors: {},
+      busy: false,
+      dangerText
+    });
+    closeTreeContextMenu();
   }
 
   function openFileActionDialog(mode: FileActionMode) {
@@ -1949,24 +2631,7 @@ function App() {
       return;
     }
 
-    const initialName = mode === "rename" ? treeContextMenu.entry?.name ?? "" : "";
-    const dangerText =
-      mode === "delete"
-        ? treeContextMenu.entry?.isDir
-          ? "会递归删除整个目录，里面的文件也一起没了。"
-          : "删除后不会自动回来，别手滑。"
-        : "";
-
-    setFileActionDialog({
-      mode,
-      targetDir: treeContextMenu.targetDir,
-      entry: treeContextMenu.entry,
-      name: initialName,
-      errors: {},
-      busy: false,
-      dangerText
-    });
-    closeTreeContextMenu();
+    openFileActionDialogForTarget(mode, treeContextMenu.targetDir, treeContextMenu.entry);
   }
 
   async function refreshTreeAfterMutation(targetPath: string, parentDir: string) {
@@ -2061,7 +2726,7 @@ function App() {
         });
         stalePath = entry.path;
       } else {
-        throw new Error("当前操作缺少目标，别拿空气走流程。");
+        throw new Error("当前操作缺少目标路径。");
       }
 
       await refreshTreeAfterMutation(stalePath, parentDir);
@@ -2127,7 +2792,7 @@ function App() {
       closeTreeContextMenu();
     } catch (error) {
       console.error(error);
-      setStatusLine(`复制失败：${label}没写进剪贴板。`);
+      setStatusLine(`复制失败：未能写入${label}。`);
     }
   }
 
@@ -2223,14 +2888,14 @@ function App() {
 
     if (!canUploadToEntry(entry)) {
       setDragTargetPath("");
-      setStatusLine(`目标 ${targetDir} 当前不可写，别往没权限的目录硬怼上传。`);
+      setStatusLine(`目标目录 ${targetDir} 不可写，无法上传。`);
       return;
     }
 
     const files = extractTransferFiles(event.dataTransfer);
     if (!files.length) {
       setDragTargetPath("");
-      setStatusLine("拖进来的不是文件，别拿空气糊弄上传。");
+      setStatusLine("未检测到可上传文件。");
       return;
     }
 
@@ -2282,8 +2947,8 @@ function App() {
   const currentWorkspaceTitle =
     activeWorkspace === "terminal"
       ? connection
-        ? `${connection.name} 的常驻终端`
-        : "等待建立 SSH 会话"
+        ? `${connection.name} 终端`
+        : "终端未连接"
       : preview?.path ?? (previewError ? "预览失败" : "还没选择文件");
   const currentWorkspaceSubtitle =
     activeWorkspace === "terminal"
@@ -2301,6 +2966,16 @@ function App() {
     ? [updateInfo.message, updateInfo.notes].filter(Boolean).join("\n\n")
     : `当前版本 ${appVersion || "--"}`;
   const updateProgressPercent = clampPercent(updateProgress?.progressPercent);
+  const updateProgressStage = updateProgress?.stage ?? null;
+  const isUpdateProgressActive = isUpdateProgressStageActive(updateProgressStage);
+  const isUpdateProgressIndeterminate =
+    updateProgressStage === "preparing" || updateProgressStage === "installing";
+  const updateProgressValueLabel =
+    updateProgressStage === "completed"
+      ? "100%"
+      : isUpdateProgressIndeterminate
+        ? "处理中"
+        : `${Math.round(updateProgressPercent)}%`;
   const releasePageUrl = updateInfo?.version
     ? `${GITHUB_RELEASES_PAGE_URL}/tag/v${updateInfo.version}`
     : GITHUB_RELEASES_PAGE_URL;
@@ -2329,14 +3004,95 @@ function App() {
           : updateProgress?.stage === "downloading"
             ? "正在下载更新"
             : "等待更新操作";
+  const updateProgressDetailLabel =
+    updateProgress?.totalBytes && updateProgress.downloadedBytes != null
+      ? `${formatBytes(updateProgress.downloadedBytes)} / ${formatBytes(updateProgress.totalBytes)}`
+      : updateProgressStage === "preparing"
+        ? "正在向 GitHub Releases 确认版本、签名和安装包信息。"
+        : updateProgressStage === "installing"
+          ? "安装包已经下载完成，系统安装器正在接管后续步骤。"
+          : updateInfo?.available
+          ? "发现新版本后，这里会显示下载进度、安装阶段和传输详情。"
+            : "还没有开始下载安装，发现新版本后这里会显示实时进度。";
+  const updateCheckOutcomeLabel =
+    lastUpdateCheck?.outcome === "available"
+      ? `发现新版本 ${lastUpdateCheck.version ?? ""}`.trim()
+      : lastUpdateCheck?.outcome === "latest"
+        ? "已经同步到最新版本"
+        : lastUpdateCheck?.outcome === "error"
+          ? "上次检查失败"
+          : "尚未检查";
+  const releaseNotesList = releaseNotesToList(updateInfo?.notes);
+  const dismissedUpdateVersion = readDismissedUpdateVersion();
+  const updatePublishedAtLabel = formatUpdatePubDate(updateInfo?.pubDate ?? null);
+  const lastUpdateCheckLabel = formatUpdateCheckTime(lastUpdateCheck?.checkedAt);
   const updateNoticeClass = updateNotice ? `update-notice ${updateNotice.tone}` : "update-notice";
   const currentEntries = currentPath ? entriesByPath[currentPath] ?? [] : entriesByPath["/"] ?? [];
   const currentDirCount = currentEntries.filter((entry) => entry.isDir).length;
   const currentFileCount = currentEntries.filter((entry) => !entry.isDir).length;
-  const searchScopeLabel =
-    activeWorkspace === "terminal" ? "终端输出" : preview?.kind === "Text" ? "文本预览" : "当前面板";
+  const activeConnectionProfile = connectionProfiles.find((item) => item.id === activeProfileId) ?? null;
+  const normalizedProfileSearchQuery = profileSearchQuery.trim().toLocaleLowerCase();
+  const visibleConnectionProfiles = connectionProfiles.filter((profile) => {
+    if (!normalizedProfileSearchQuery) {
+      return true;
+    }
+
+    const haystack = [profile.name, profile.host, profile.port, profile.username].join(" ").toLocaleLowerCase();
+    return haystack.includes(normalizedProfileSearchQuery);
+  });
+  const pinnedConnectionProfiles = connectionProfiles.filter((item) => item.pinned).length;
+  const connectionStageLabel = formatConnectionStage(connectionProgress?.stage);
+  const connectionProgressPercent = connectionProgress
+    ? clampPercent((connectionProgress.currentStep / Math.max(connectionProgress.totalSteps || 1, 1)) * 100)
+    : 0;
+  const connectionProgressDetail =
+    connectionProgress?.detail ??
+    (connection
+      ? `当前会话已连接到 ${connection.host}，主目录 ${connection.homePath}。`
+      : "支持密码登录，连接超时后会及时返回。");
+  const connectionActionLabel = connection ? "更新连接配置" : "新建连接";
+  const connectionConfigLabel = connectionProfiles.length
+    ? `连接配置 · ${connectionProfiles.length}`
+    : connectionActionLabel;
+  const savedProfilesLabel = connectionProfiles.length
+    ? `已保存连接 · ${connectionProfiles.length}`
+    : "已保存连接";
+  const connectionUserLabel = connection?.name.includes("@")
+    ? connection.name.split("@")[0]
+    : form.username.trim() || "--";
+  const sidebarPathLabel = currentPath || connection?.homePath || "/";
+  const sidebarSummaryLabel = connection ? `${currentDirCount} 个目录 · ${currentFileCount} 个文件` : "未连接";
+  const previewEditorLanguage = resolveEditorLanguage(preview?.language);
   const searchCounterLabel = searchResultCount ? `${searchActiveIndex + 1} / ${searchResultCount}` : "0 / 0";
-  const historyLabel = historySelection || commandDraft.trim() || commandHistory[0] || "历史命令";
+  const currentDirectoryPath = currentPath || connection?.homePath || "/";
+  const scopedCommandHistory = commandHistory.filter((item) => item.cwd === currentDirectoryPath);
+  const historyTriggerSummary = commandHistory.length
+    ? scopedCommandHistory.length
+      ? `最近命令 ${scopedCommandHistory.length}/${commandHistory.length}`
+      : `最近命令 (${commandHistory.length})`
+    : "最近命令";
+  const workbenchStyle = isNarrowWorkbench
+    ? undefined
+    : {
+        gridTemplateColumns: `${sidebarWidth}px 14px minmax(0, 1fr)`
+      };
+
+  const startSidebarResize = (event: ReactMouseEvent<HTMLDivElement>) => {
+    if (isNarrowWorkbench) {
+      return;
+    }
+
+    event.preventDefault();
+    sidebarResizeStateRef.current = {
+      startX: event.clientX,
+      startWidth: sidebarWidth
+    };
+    setIsSidebarResizing(true);
+  };
+
+  const resetSidebarWidth = () => {
+    setSidebarWidth(DEFAULT_SIDEBAR_WIDTH);
+  };
 
   return (
     <div className="shell-app">
@@ -2385,10 +3141,17 @@ function App() {
             <div className="update-progress-block">
               <div className="update-progress-meta">
                 <span>{updateProgressStatusLabel}</span>
-                <strong>{Math.round(updateProgressPercent)}%</strong>
+                <strong>{updateProgressValueLabel}</strong>
               </div>
               <div className="update-progress-track">
-                <div className="update-progress-fill" style={{ width: `${updateProgressPercent}%` }} />
+                <div
+                  className={`update-progress-fill ${isUpdateProgressIndeterminate ? "indeterminate" : ""}`}
+                  style={isUpdateProgressIndeterminate ? undefined : { width: `${updateProgressPercent}%` }}
+                />
+              </div>
+              <div className="update-progress-detail-row">
+                <span>{updateProgress?.message ?? "正在等待更新任务启动..."}</span>
+                <strong>{updateProgressDetailLabel}</strong>
               </div>
             </div>
           ) : null}
@@ -2441,178 +3204,148 @@ function App() {
         </aside>
       ) : null}
 
-      <div
-        className="corner-toolbar glass-panel drag-region"
-        onMouseDown={(event) => void startWindowDragging(event)}
-        onDoubleClick={(event) => {
+      <TopToolbar
+        savedProfilesMenuRef={savedProfilesMenuRef}
+        connection={connection}
+        connectionHostText={connectionHostText}
+        basicStatusLabel={basicStatusLabel}
+        basicLatencyLabel={basicLatencyLabel}
+        versionLabel={versionLabel}
+        statusLine={statusLine}
+        savedProfilesLabel={savedProfilesLabel}
+        connectionConfigLabel={connectionConfigLabel}
+        currentPath={currentPath}
+        isConnecting={isConnecting}
+        isListing={isListing}
+        isWindowFullscreen={isWindowFullscreen}
+        isWindowMaximized={isWindowMaximized}
+        updateInfo={updateInfo}
+        updateButtonLabel={updateButtonLabel}
+        updateButtonTitle={updateButtonTitle}
+        activeProfileId={activeProfileId}
+        connectionProfiles={connectionProfiles}
+        isSavedProfilesMenuOpen={isSavedProfilesMenuOpen}
+        onWindowMouseDown={(event) => {
+          void startWindowDragging(event);
+        }}
+        onWindowDoubleClick={(event) => {
           if (isWindowDragBlockedTarget(event.target) || isWindowFullscreen) {
             return;
           }
           void toggleWindowMaximize();
         }}
-      >
-        <div className="toolbar-host">
-          <span className={`host-status-dot ${connection ? "live" : ""}`} aria-hidden="true" />
-          <div className="toolbar-host-meta">
-            <strong>{connection?.name ?? "尚未连接"}</strong>
-            <span>{connectionHostText}</span>
-          </div>
-          <div className="toolbar-host-chips">
-            <span className="basic-chip">{basicStatusLabel}</span>
-            <span className="basic-chip">{connection?.osLabel ?? "Remote Host"}</span>
-            <span className="basic-chip">{basicLatencyLabel}</span>
-            <span className={`basic-chip ${updateInfo?.available ? "update-chip-live" : ""}`}>{versionLabel}</span>
-            <div className="detail-hover">
-              <button className="ghost-button small detail-button" disabled={!connection}>
-                主机详情
-              </button>
-              {connection ? (
-                <div className="detail-card">
-                  <div className="detail-card-grid">
-                    <div className="detail-item">
-                      <span>主机</span>
-                      <strong>{connectionHostText}</strong>
-                    </div>
-                    <div className="detail-item">
-                      <span>协议</span>
-                      <strong>{connection.protocol}</strong>
-                    </div>
-                    <div className="detail-item">
-                      <span>主目录</span>
-                      <strong>{connection.homePath}</strong>
-                    </div>
-                    <div className="detail-item">
-                      <span>延迟</span>
-                      <strong>{basicLatencyLabel}</strong>
-                    </div>
-                    <div className="detail-item">
-                      <span>CPU / 内存</span>
-                      <strong>待接入实时采集</strong>
-                    </div>
-                    <div className="detail-item">
-                      <span>最近状态</span>
-                      <strong>{statusLine}</strong>
-                    </div>
-                  </div>
-                </div>
-              ) : null}
-            </div>
-          </div>
-        </div>
+        onToggleSavedProfilesMenu={() => setIsSavedProfilesMenuOpen((previous) => !previous)}
+        onSaveCurrentProfile={() => {
+          saveCurrentConnectionProfile();
+        }}
+        onOpenConnectModal={() => setIsConnectModalOpen(true)}
+        onConnectWithProfile={(profile) => {
+          void connectWithProfile(profile);
+        }}
+        onDisconnect={() => {
+          void disconnect();
+        }}
+        onUploadClipboardFiles={() => {
+          void uploadWindowsClipboardFiles(currentPath || connection?.homePath || "/");
+        }}
+        onGoParent={() => {
+          void goParent();
+        }}
+        onRefreshDirectory={() => {
+          void loadDirectory(currentPath);
+        }}
+        onOpenAbout={openAboutDialog}
+        onToggleFullscreen={() => {
+          void toggleWindowFullscreen();
+        }}
+        onMinimize={() => {
+          void minimizeWindow();
+        }}
+        onToggleMaximize={() => {
+          void toggleWindowMaximize();
+        }}
+        onCloseWindow={() => {
+          void closeWindow();
+        }}
+        formatTime={formatUpdateCheckTime}
+      />
 
-        <div className="corner-actions">
-          <button className="ghost-button small" onClick={() => setIsConnectModalOpen(true)}>
-            {connection ? "连接配置" : "去连接"}
-          </button>
-          <button
-            className="ghost-button small"
-            disabled={!connection}
-            onClick={() =>
-              void uploadWindowsClipboardFiles(currentPath || connection?.homePath || "/")
-            }
-          >
-            上传
-          </button>
-          <button className="ghost-button small" disabled={!connection} onClick={() => void goParent()}>
-            上一级
-          </button>
-          <button
-            className="ghost-button small"
-            disabled={!connection || !currentPath}
-            onClick={() => void loadDirectory(currentPath)}
-          >
-            {isListing ? "刷新中..." : "刷新"}
-          </button>
-          <button
-            className={`ghost-button small update-button ${updateInfo?.available ? "update-ready" : ""}`}
-            onClick={() => openAboutDialog()}
-            title={updateButtonTitle}
-          >
-            {updateButtonLabel}
-          </button>
-          <button
-            className="ghost-button small"
-            onClick={() => void toggleWindowFullscreen()}
-            title={isWindowFullscreen ? "退出全屏" : "全屏"}
-          >
-            {isWindowFullscreen ? "退出全屏" : "全屏"}
-          </button>
-          <div className="window-controls">
-            <button className="window-button" onClick={() => void minimizeWindow()} title="最小化">
-              _
-            </button>
-            <button
-              className="window-button"
-              onClick={() => void toggleWindowMaximize()}
-              title={isWindowMaximized ? "还原" : "最大化"}
-            >
-              {isWindowMaximized ? "❐" : "□"}
-            </button>
-            <button className="window-button danger" onClick={() => void closeWindow()} title="关闭">
-              ×
-            </button>
-          </div>
-        </div>
-      </div>
-
-      <div className="workbench">
+      <div className="workbench" style={workbenchStyle}>
         <aside className="navigator-panel glass-panel">
-          <div className="navigator-head">
-            <div className="brand-card sidebar-brand compact-brand">
-              <BrandLogo />
-              <div className="brand-copy">
-                <h1>FShell</h1>
-                <span>Modern SSH Workspace</span>
+          <section className="navigator-toolbar">
+            <div className="navigator-toolbar-main">
+              <BrandLogo className="mini-sidebar-logo" />
+              <div className="navigator-toolbar-meta">
+                <strong>{sidebarPathLabel}</strong>
+                <span>{connection ? `${connectionUserLabel} @ ${connectionHostText}` : "未连接"}</span>
               </div>
+              <span className={`status-pill ${connection ? "live" : connectionProgress?.isError ? "" : "progress-pill"}`}>
+                {connectionStageLabel}
+              </span>
             </div>
-          </div>
 
-          <section className="tree-shell">
-            <div
-              className={`file-list ${dragTargetPath === (currentPath || connection?.homePath || "/") ? "drop-ready" : ""}`}
-              onDragOver={(event) =>
-                handleTreeDragOver(event, currentPath || connection?.homePath || "/")
-              }
-              onDragLeave={(event) =>
-                handleTreeDragLeave(event, currentPath || connection?.homePath || "/")
-              }
-              onDrop={(event) => void handleTreeDrop(event, null)}
-              onContextMenu={(event) =>
-                openTreeContextMenu(
-                  event,
-                  null,
-                  currentPath || connection?.homePath || "/",
-                  currentPath || connection?.homePath || "/"
-                )
-              }
-            >
-              {connection && entriesByPath["/"]?.length ? (
-                <>
-                  <div className="tree-header">
-                    <span>{currentPath || "/"}</span>
-                    <span>
-                      {isUploading ? "上传中..." : `${currentDirCount} 个目录 · ${currentFileCount} 个文件`}
-                    </span>
-                  </div>
-                  <div className="tree-drop-hint">
-                    拖到目录节点就上传到对应目录。`Ctrl + V` 能吃截图，Windows 复制文件后也能点“贴文件”。
-                  </div>
-                  {renderTree("/")}
-                </>
-              ) : (
-                <div className="empty-state tree-empty-state">
-                  <strong>{connection ? "当前目录没有内容" : "先连接 SSH"}</strong>
-                  <p>
-                    {connection
-                      ? "可能目录为空，也可能你没权限。拖文件进来或直接粘贴，也会按当前目录上传。"
-                      : "连上之后这里就是常驻文件树，不再让连接表单霸着左边。"}
-                  </p>
-                </div>
-              )}
+            <div className={`connect-progress-card compact ${connectionProgress?.isError ? "error" : connection ? "connected" : ""}`}>
+              <div className="connect-progress-head">
+                <strong>{connectionProgress?.message ?? sidebarSummaryLabel}</strong>
+                <span>{connectionProgress ? `${Math.round(connectionProgressPercent)}%` : connection ? "100%" : "--"}</span>
+              </div>
+              <div className="update-progress-track connect-progress-track">
+                <div className="update-progress-fill" style={{ width: `${connection ? 100 : connectionProgressPercent}%` }} />
+              </div>
+              <p>{connectionProgressDetail}</p>
+            </div>
+
+            <div className="navigator-toolbar-actions">
+              <button className="primary-button small-primary" disabled={isConnecting} onClick={() => setIsConnectModalOpen(true)}>
+                {isConnecting ? "连接中..." : connectionConfigLabel}
+              </button>
+              <button className="ghost-button small" disabled={!connection || isConnecting} onClick={() => void disconnect()}>
+                断开
+              </button>
+              <button
+                className="ghost-button small"
+                disabled={!connection || !currentPath || isListing}
+                onClick={() => void loadDirectory(currentPath || "/")}
+              >
+                {isListing ? "刷新中..." : "刷新"}
+              </button>
             </div>
           </section>
 
+          <RemoteFileTree
+            fileListClassName={`file-list ${dragTargetPath === (currentPath || connection?.homePath || "/") ? "drop-ready" : ""}`}
+            currentDirectoryPath={currentDirectoryPath}
+            summaryLabel={isUploading ? "上传中..." : `${currentDirCount} 个目录 · ${currentFileCount} 个文件`}
+            hasConnection={Boolean(connection)}
+            hasRootEntries={Boolean(entriesByPath["/"]?.length)}
+            treeNodes={renderTree("/")}
+            onRootDragOver={(event) => handleTreeDragOver(event, currentPath || connection?.homePath || "/")}
+            onRootDragLeave={(event) => handleTreeDragLeave(event, currentPath || connection?.homePath || "/")}
+            onRootDrop={(event) => {
+              void handleTreeDrop(event, null);
+            }}
+            onRootContextMenu={(event) =>
+              openTreeContextMenu(
+                event,
+                null,
+                currentPath || connection?.homePath || "/",
+                currentPath || connection?.homePath || "/"
+              )
+            }
+          />
+
         </aside>
+
+        {!isNarrowWorkbench ? (
+          <div
+            className={`workbench-divider ${isSidebarResizing ? "active" : ""}`}
+            onMouseDown={startSidebarResize}
+            onDoubleClick={resetSidebarWidth}
+            role="separator"
+            aria-label="调整文件区宽度"
+            aria-orientation="vertical"
+          />
+        ) : null}
 
         <main className="workspace-panel">
           <section className="glass-panel workspace-card">
@@ -2622,33 +3355,28 @@ function App() {
                   className={`tab-button ${activeWorkspace === "terminal" ? "active" : ""}`}
                   onClick={() => setActiveWorkspace("terminal")}
                 >
-                  常驻终端
+                  终端
                 </button>
                 <button
                   className={`tab-button ${activeWorkspace === "preview" ? "active" : ""}`}
                   onClick={() => setActiveWorkspace("preview")}
                 >
-                  文件预览
+                  预览
                 </button>
               </div>
               <div className="mini-actions">
                 {activeWorkspace === "preview" ? (
-                  <>
-                    <button
-                      className="ghost-button small"
-                      disabled={!preview || preview.kind !== "Text" || preview.readonly}
-                      onClick={() => void pasteClipboard()}
-                    >
-                      贴文本
-                    </button>
-                    <button
-                      className="primary-button small-primary"
-                      disabled={!preview || preview.kind !== "Text" || preview.readonly || isSaving}
-                      onClick={() => void savePreview()}
-                    >
-                      {preview?.readonly ? "只读" : isSaving ? "保存中..." : "保存"}
-                    </button>
-                  </>
+                  <PreviewWorkspaceActions
+                    preview={preview}
+                    isSaving={isSaving}
+                    saveFeedback={saveFeedback}
+                    onPasteText={() => {
+                      void pasteClipboard();
+                    }}
+                    onSave={() => {
+                      void savePreview();
+                    }}
+                  />
                 ) : (
                   <span className={`status-pill terminal-status ${connection ? "live" : ""}`}>
                     {terminalStatusLabel}
@@ -2665,8 +3393,8 @@ function App() {
               <div className="workspace-meta-side">
                 <span>
                   {activeWorkspace === "preview"
-                    ? `${preview?.language ?? preview?.kind ?? "无预览"} · ${selectedEntry ? formatPermissions(selectedEntry.permissions) : "--"}${preview?.readonly ? " · 只读" : ""}`
-                    : "Interactive Shell"}
+                    ? `${preview?.language ?? preview?.kind ?? "无预览"} · ${selectedEntry ? formatPermissions(selectedEntry.permissions) : "--"}${preview?.readonly ? " · 权限提示" : ""}`
+                    : "SSH 终端"}
                 </span>
                 <span>
                   {activeWorkspace === "preview"
@@ -2684,617 +3412,250 @@ function App() {
               </div>
 
               <div className={`workspace-pane ${activeWorkspace === "preview" ? "active" : ""}`}>
-                {preview?.kind === "Text" ? (
-                  <textarea
-                    ref={editorRef}
-                    className={`editor ${preview.readonly ? "readonly-editor" : ""}`}
-                    spellCheck={false}
-                    readOnly={preview.readonly}
-                    value={editorContent}
-                    onChange={(event) => setEditorContent(event.target.value)}
-                  />
-                ) : preview?.kind === "Image" && preview.content ? (
-                  <div className="image-preview-shell">
-                    <img className="image-preview" src={preview.content} alt={preview.path} />
-                  </div>
-                ) : previewError ? (
-                  <div className="empty-state preview-state error-state">
-                    <strong>无法预览</strong>
-                    <p>{previewError}</p>
-                  </div>
-                ) : (
-                  <div className="empty-state preview-state">
-                    <strong>{preview?.path ?? "选择一个远端文件"}</strong>
-                    <p>
-                      {preview
-                        ? preview.kind === "Binary"
-                          ? "这是二进制文件，不适合直接按文本硬怼。"
-                          : `当前文件类型是 ${preview.kind}，后面可以继续接更专门的渲染器。`
-                        : "点左边文件树里的文件，这里会切到预览页签并显示真实内容。"}
-                    </p>
-                  </div>
-                )}
+                <PreviewWorkspace
+                  preview={preview}
+                  previewError={previewError}
+                  editorContent={editorContent}
+                  editorLanguage={previewEditorLanguage}
+                  isActive={activeWorkspace === "preview"}
+                  selectedEntry={selectedEntry}
+                  selectionPath={selectionPath}
+                  onSave={() => {
+                    void savePreview();
+                  }}
+                  onEditorChange={setEditorContent}
+                  onEditorMount={handleEditorMount}
+                />
               </div>
             </div>
 
             {activeWorkspace === "terminal" ? (
-              <div className="bottom-toolbar">
-                <div className="toolbar-group command-group">
-                  <div className="history-dropdown" ref={historyMenuRef}>
-                    <button
-                      className="toolbar-button history-trigger"
-                      disabled={!commandHistory.length}
-                      onClick={() => setIsHistoryMenuOpen((previous) => !previous)}
-                      title={historySelection || "历史命令"}
-                    >
-                      <span className="history-trigger-text">
-                        {historyLabel}
-                      </span>
-                      <span className={`history-caret ${isHistoryMenuOpen ? "open" : ""}`}>▾</span>
-                    </button>
-                    {isHistoryMenuOpen && commandHistory.length ? (
-                      <div className="history-menu glass-panel">
-                        <div className="history-menu-header">
-                          <strong>最近命令</strong>
-                          <span>{commandHistory.length} 条</span>
-                        </div>
-                        {commandHistory.map((command) => (
-                          <button
-                            key={command}
-                            className={`history-option ${historySelection === command ? "active" : ""}`}
-                            onClick={() => {
-                              setIsHistoryMenuOpen(false);
-                              void fillTerminalCommand(command);
-                            }}
-                            title={command}
-                          >
-                            <span className="history-option-command">{command}</span>
-                          </button>
-                        ))}
-                      </div>
-                    ) : null}
-                  </div>
-                  <button
-                    className="toolbar-button"
-                    disabled={!connection || !commandDraft.trim()}
-                    onClick={() => void clearCurrentCommand()}
-                  >
-                    清空当前行
-                  </button>
-                  <button
-                    className="toolbar-button"
-                    disabled={!connection || activeWorkspace !== "terminal"}
-                    onClick={() => void requestTabCompletion()}
-                  >
-                    Tab 补全
-                  </button>
-                  <button
-                    className="toolbar-button accent"
-                    disabled={!connection || !commandDraft.trim()}
-                    onClick={() => void executeTerminalCommand()}
-                  >
-                    执行当前行
-                  </button>
-                </div>
+              <TerminalToolbar
+                historyMenuRef={historyMenuRef}
+                searchInputRef={searchInputRef}
+                isHistoryMenuOpen={isHistoryMenuOpen}
+                commandHistory={commandHistory}
+                scopedCommandHistory={scopedCommandHistory}
+                historySelection={historySelection}
+                historyTriggerSummary={historyTriggerSummary}
+                currentDirectoryPath={currentDirectoryPath}
+                commandDraft={commandDraft}
+                searchQuery={searchQuery}
+                searchResultCount={searchResultCount}
+                searchCounterLabel={searchCounterLabel}
+                statusLine={statusLine}
+                hasConnection={Boolean(connection)}
+                onToggleHistoryMenu={() => setIsHistoryMenuOpen((previous) => !previous)}
+                onUseHistoryCommand={(command) => {
+                  setIsHistoryMenuOpen(false);
+                  void fillTerminalCommand(command);
+                }}
+                onCopyCommand={(command) => {
+                  void copyTextToClipboard(command, "命令");
+                }}
+                onClearCurrentCommand={() => {
+                  void clearCurrentCommand();
+                }}
+                onRequestTabCompletion={() => {
+                  void requestTabCompletion();
+                }}
+                onExecuteTerminalCommand={() => {
+                  void executeTerminalCommand();
+                }}
+                onSearchQueryChange={setSearchQuery}
+                onSearchKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    event.preventDefault();
+                    jumpSearch(event.shiftKey ? -1 : 1);
+                    return;
+                  }
 
-                <div className="toolbar-group search-group">
-                  <input
-                    ref={searchInputRef}
-                    className="toolbar-input search-input"
-                    placeholder={`查找${searchScopeLabel}`}
-                    value={searchQuery}
-                    onChange={(event) => setSearchQuery(event.target.value)}
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter") {
-                        event.preventDefault();
-                        jumpSearch(event.shiftKey ? -1 : 1);
-                        return;
-                      }
-
-                      if (event.key === "Escape") {
-                        event.preventDefault();
-                        clearSearch();
-                      }
-                    }}
-                  />
-                  <button
-                    className="toolbar-button icon-button"
-                    disabled={!searchResultCount}
-                    onClick={() => jumpSearch(-1)}
-                    title="上一个匹配"
-                  >
-                    ↑
-                  </button>
-                  <button
-                    className="toolbar-button icon-button"
-                    disabled={!searchResultCount}
-                    onClick={() => jumpSearch(1)}
-                    title="下一个匹配"
-                  >
-                    ↓
-                  </button>
-                  <span className="toolbar-counter">{searchCounterLabel}</span>
-                </div>
-
-                <div className="toolbar-group utility-group">
-                  <button className="toolbar-button" onClick={() => clearSearch()}>
-                    清空查找
-                  </button>
-                  <button
-                    className="toolbar-button"
-                    disabled={!connection || activeWorkspace !== "terminal"}
-                    onClick={() => void clearTerminal()}
-                  >
-                    Clear
-                  </button>
-                  <span className="toolbar-hint">Ctrl + F</span>
-                  <span className="toolbar-status" title={statusLine}>
-                    {statusLine}
-                  </span>
-                </div>
-              </div>
+                  if (event.key === "Escape") {
+                    event.preventDefault();
+                    clearSearch();
+                  }
+                }}
+                onJumpSearch={jumpSearch}
+                onClearSearch={clearSearch}
+                onClearTerminal={() => {
+                  void clearTerminal();
+                }}
+                formatHistoryTime={formatUpdateCheckTime}
+              />
             ) : null}
           </section>
         </main>
       </div>
 
       {treeContextMenu ? (
-        <div
-          ref={treeContextMenuRef}
-          className="tree-context-menu glass-panel"
-          style={{ left: treeContextMenu.x, top: treeContextMenu.y }}
-        >
-          <div className="tree-context-menu-head">
-            <strong>{treeContextMenu.entry?.name ?? treeContextMenu.targetLabel}</strong>
-            <span>{treeContextMenu.entry ? entryAccessLabel(treeContextMenu.entry) : "当前目录"}</span>
-          </div>
-
-          {treeContextMenu.entry?.isDir ? (
-            <button
-              className="context-action"
-              disabled={!canOpenDirectory(treeContextMenu.entry)}
-              onClick={() => {
-                closeTreeContextMenu();
-                void openEntry(treeContextMenu.entry!);
-              }}
-            >
-              打开目录
-            </button>
-          ) : treeContextMenu.entry ? (
-            <button
-              className="context-action"
-              disabled={!canPreviewEntry(treeContextMenu.entry)}
-              onClick={() => {
-                closeTreeContextMenu();
-                void openEntry(treeContextMenu.entry!);
-              }}
-            >
-              预览文件
-            </button>
-          ) : null}
-
-          <button
-            className="context-action"
-            disabled={!connection || !canCreateInDirectory(treeContextMenu.targetDir)}
-            onClick={() => openFileActionDialog("new-file")}
-          >
-            新建文件
-          </button>
-
-          <button
-            className="context-action"
-            disabled={!connection || !canCreateInDirectory(treeContextMenu.targetDir)}
-            onClick={() => openFileActionDialog("new-directory")}
-          >
-            新建目录
-          </button>
-
-          {treeContextMenu.entry ? (
-            <button
-              className="context-action"
-              disabled={!canManageEntry(treeContextMenu.entry)}
-              onClick={() => openFileActionDialog("rename")}
-            >
-              重命名
-            </button>
-          ) : null}
-
-          <button
-            className="context-action"
-            disabled={!connection || !canDownloadEntry(treeContextMenu.entry, treeContextMenu.targetDir)}
-            onClick={() => {
-              const target = resolveDownloadTarget(treeContextMenu.entry, treeContextMenu.targetDir);
-              void downloadRemoteTarget(target.remotePath, target.suggestedName, target.isDir);
-            }}
-          >
-            {treeContextMenu.entry
+        <TreeContextMenu
+          menuRef={treeContextMenuRef}
+          menu={treeContextMenu}
+          entryAccessLabel={treeContextMenu.entry ? entryAccessLabel(treeContextMenu.entry) : "当前目录"}
+          canOpenDirectory={Boolean(treeContextMenu.entry && canOpenDirectory(treeContextMenu.entry))}
+          canPreviewEntry={Boolean(treeContextMenu.entry && canPreviewEntry(treeContextMenu.entry))}
+          canCreateInDirectory={canCreateInDirectory(treeContextMenu.targetDir)}
+          canManageEntry={Boolean(treeContextMenu.entry && canManageEntry(treeContextMenu.entry))}
+          canDownloadEntry={canDownloadEntry(treeContextMenu.entry, treeContextMenu.targetDir)}
+          canUploadToEntry={canUploadToEntry(treeContextMenu.entry)}
+          hasConnection={Boolean(connection)}
+          downloadLabel={
+            treeContextMenu.entry
               ? treeContextMenu.entry.isDir
                 ? "下载目录"
                 : "下载文件"
-              : "下载当前目录"}
-          </button>
-
-          <button
-            className="context-action"
-            disabled={!connection}
-            onClick={() => {
-              closeTreeContextMenu();
-              void loadDirectory(treeContextMenu.targetDir);
-            }}
-          >
-            刷新这里
-          </button>
-
-          <button
-            className="context-action"
-            disabled={!connection}
-            onClick={() => void jumpTerminalToPath(treeContextMenu.targetDir)}
-          >
-            在终端进入这里
-          </button>
-
-          <button
-            className="context-action"
-            disabled={!canUploadToEntry(treeContextMenu.entry)}
-            onClick={() => void pasteClipboardToTarget(treeContextMenu.targetDir)}
-          >
-            贴文件到这里
-          </button>
-
-          <button
-            className="context-action"
-            onClick={() => void copyTextToClipboard(treeContextMenu.targetDir, "路径")}
-          >
-            复制路径
-          </button>
-
-          {treeContextMenu.entry ? (
-            <button
-              className="context-action"
-              onClick={() => void copyTextToClipboard(treeContextMenu.entry!.name, "文件名")}
-            >
-              复制名称
-            </button>
-          ) : null}
-
-          {treeContextMenu.entry ? (
-            <button
-              className="context-action danger-action"
-              disabled={!canManageEntry(treeContextMenu.entry)}
-              onClick={() => openFileActionDialog("delete")}
-            >
-              删除
-            </button>
-          ) : null}
-        </div>
+              : "下载当前目录"
+          }
+          onOpenEntry={() => {
+            closeTreeContextMenu();
+            if (treeContextMenu.entry) {
+              void openEntry(treeContextMenu.entry);
+            }
+          }}
+          onCreateFile={() => openFileActionDialog("new-file")}
+          onCreateDirectory={() => openFileActionDialog("new-directory")}
+          onRename={() => openFileActionDialog("rename")}
+          onDownload={() => {
+            const target = resolveDownloadTarget(treeContextMenu.entry, treeContextMenu.targetDir);
+            void downloadRemoteTarget(target.remotePath, target.suggestedName, target.isDir);
+          }}
+          onRefresh={() => {
+            closeTreeContextMenu();
+            void loadDirectory(treeContextMenu.targetDir);
+          }}
+          onJumpInTerminal={() => {
+            void jumpTerminalToPath(treeContextMenu.targetDir);
+          }}
+          onPasteFiles={() => {
+            void pasteClipboardToTarget(treeContextMenu.targetDir);
+          }}
+          onCopyPath={() => {
+            void copyTextToClipboard(treeContextMenu.targetDir, "路径");
+          }}
+          onCopyName={() => {
+            if (treeContextMenu.entry) {
+              void copyTextToClipboard(treeContextMenu.entry.name, "文件名");
+            }
+          }}
+          onDelete={() => openFileActionDialog("delete")}
+        />
       ) : null}
 
       {fileActionDialog ? (
-        <div className="modal-backdrop">
-          <section className="glass-panel connect-dialog action-dialog" onClick={(event) => event.stopPropagation()}>
-            <div className="section-title">
-              <div>
-                <p className="eyebrow">File Action</p>
-                <h2>{fileActionTitle(fileActionDialog.mode)}</h2>
-              </div>
-              <span className={`status-pill ${fileActionDialog.mode === "delete" ? "" : "live"}`}>
-                {fileActionDialog.entry ? fileActionDialog.entry.name : fileActionDialog.targetDir}
-              </span>
-            </div>
-
-            {fileActionDialog.mode === "delete" ? (
-              <div className="form-alert error-alert">
-                <strong>确认删除</strong>
-                <span>
-                  即将删除 `{fileActionDialog.entry?.path}`。{fileActionDialog.dangerText}
-                </span>
-              </div>
-            ) : (
-              <label className={`field ${fileActionDialog.errors.name ? "has-error" : ""}`}>
-                <span>
-                  {fileActionDialog.mode === "rename" ? "新的名称" : "名称"}
-                </span>
-                <input
-                  ref={fileActionInputRef}
-                  placeholder={fileActionDialog.mode === "new-file" ? "例如 index.html" : "输入名称"}
-                  value={fileActionDialog.name}
-                  onChange={(event) =>
-                    setFileActionDialog((previous) =>
-                      previous
-                        ? {
-                            ...previous,
-                            name: event.target.value,
-                            errors: { ...previous.errors, name: undefined }
-                          }
-                        : previous
-                    )
+        <FileActionDialog
+          inputRef={fileActionInputRef}
+          dialog={fileActionDialog}
+          title={fileActionTitle(fileActionDialog.mode)}
+          confirmLabel={fileActionConfirmLabel(fileActionDialog.mode, fileActionDialog.busy)}
+          onNameChange={(value) =>
+            setFileActionDialog((previous) =>
+              previous
+                ? {
+                    ...previous,
+                    name: value,
+                    errors: { ...previous.errors, name: undefined }
                   }
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter") {
-                      event.preventDefault();
-                      void submitFileActionDialog();
-                    }
-                  }}
-                />
-                {fileActionDialog.errors.name ? <small>{fileActionDialog.errors.name}</small> : null}
-              </label>
-            )}
-
-            <div className="list-block action-dialog-meta">
-              <div className="path-chip subtle">{fileActionDialog.targetDir}</div>
-              {fileActionDialog.entry ? (
-                <div className="path-chip subtle">{fileActionDialog.entry.path}</div>
-              ) : null}
-            </div>
-
-            <div className="action-row">
-              <button
-                className={`primary-button ${fileActionDialog.mode === "delete" ? "danger-primary" : ""}`}
-                disabled={fileActionDialog.busy}
-                onClick={() => void submitFileActionDialog()}
-              >
-                {fileActionConfirmLabel(fileActionDialog.mode, fileActionDialog.busy)}
-              </button>
-              <button
-                className="ghost-button"
-                disabled={fileActionDialog.busy}
-                onClick={() => closeFileActionDialog()}
-              >
-                取消
-              </button>
-            </div>
-          </section>
-        </div>
+                : previous
+            )
+          }
+          onNameKeyDown={(event) => {
+            if (event.key === "Enter") {
+              event.preventDefault();
+              void submitFileActionDialog();
+            }
+          }}
+          onConfirm={() => {
+            void submitFileActionDialog();
+          }}
+          onCancel={closeFileActionDialog}
+        />
       ) : null}
 
-      {isAboutDialogOpen ? (
-        <div className="modal-backdrop">
-          <section className="glass-panel connect-dialog about-dialog" onClick={(event) => event.stopPropagation()}>
-            <div className="section-title">
-              <div>
-                <p className="eyebrow">Product</p>
-                <h2>关于 / 更新</h2>
-              </div>
-              <span className={`status-pill ${updateInfo?.available ? "about-pill-highlight" : "live"}`}>
-                {updateStatusLabel}
-              </span>
-            </div>
+      <AboutUpdateDialog
+        isOpen={isAboutDialogOpen}
+        appVersion={appVersion}
+        updateInfo={updateInfo}
+        updateProgress={updateProgress}
+        updateStatusLabel={updateStatusLabel}
+        publishedAtLabel={updatePublishedAtLabel}
+        updateLatencyLabel={updateLatencyLabel}
+        updateProgressStatusLabel={updateProgressStatusLabel}
+        updateProgressDetailLabel={updateProgressDetailLabel}
+        updateProgressValueLabel={updateProgressValueLabel}
+        updateCheckOutcomeLabel={updateCheckOutcomeLabel}
+        updateProgressPercent={updateProgressPercent}
+        isUpdateProgressActive={isUpdateProgressActive}
+        isUpdateProgressIndeterminate={isUpdateProgressIndeterminate}
+        isCheckingUpdate={isCheckingUpdate}
+        isInstallingUpdate={isInstallingUpdate}
+        aboutPrimaryLabel={aboutPrimaryLabel}
+        lastCheckedAtLabel={lastUpdateCheckLabel}
+        dismissedUpdateVersion={dismissedUpdateVersion}
+        releasePageUrl={releasePageUrl}
+        latestJsonUrl={GITHUB_LATEST_JSON_URL}
+        releaseNotesList={releaseNotesList}
+        updatePreferences={updatePreferences}
+        onClose={closeAboutDialog}
+        onCheckUpdate={() => {
+          void checkAppUpdate();
+        }}
+        onInstallUpdate={() => {
+          void installAppUpdate();
+        }}
+        onCopyReleasePage={() => {
+          void copyTextToClipboard(releasePageUrl, "Release 链接");
+        }}
+        onCopyLatestJson={() => {
+          void copyTextToClipboard(GITHUB_LATEST_JSON_URL, "更新源地址");
+        }}
+        onCopyVersion={() => {
+          void copyTextToClipboard(appVersion || "--", "版本号");
+        }}
+        onUpdatePreference={updatePreference}
+        onClearDismissedVersion={clearDismissedUpdateVersion}
+      />
 
-            {updateInfo?.available ? (
-              <div className="form-alert update-alert">
-                <strong>发现可安装更新</strong>
-                <span>{updateInfo.message}</span>
-              </div>
-            ) : (
-              <div className="form-alert about-alert">
-                <strong>当前版本信息</strong>
-                <span>{updateInfo?.message ?? "还没查过更新，点下面按钮就会去 GitHub Releases 拉最新状态。"}</span>
-              </div>
-            )}
-
-            <div className="about-grid">
-              <div className="about-card">
-                <span>当前版本</span>
-                <strong>{appVersion || "--"}</strong>
-                <small>当前运行中的桌面版本</small>
-              </div>
-              <div className="about-card">
-                <span>最新版本</span>
-                <strong>{updateInfo?.version ?? appVersion ?? "--"}</strong>
-                <small>{updateInfo?.available ? "GitHub Releases 已发现更新" : "已同步到最新发布状态"}</small>
-              </div>
-              <div className="about-card">
-                <span>发布时间</span>
-                <strong>{formatUpdatePubDate(updateInfo?.pubDate ?? null)}</strong>
-                <small>来自 updater 返回的发布时间</small>
-              </div>
-              <div className="about-card">
-                <span>更新源</span>
-                <strong>GitHub Releases</strong>
-                <small>latest.json + installer signatures</small>
-              </div>
-              <div className="about-card">
-                <span>检查耗时</span>
-                <strong>{updateLatencyLabel}</strong>
-                <small>GitHub 访问、代理状态和签名校验都会拖慢这里。</small>
-              </div>
-              <div className="about-card">
-                <span>当前阶段</span>
-                <strong>{updateProgressStatusLabel}</strong>
-                <small>{isInstallingUpdate ? "安装进行中，别急着重复点击。" : "启动后会自动后台检查一次。"}</small>
-              </div>
-            </div>
-
-            <div className="about-progress-block">
-              <div className="update-progress-meta">
-                <span>{updateProgress?.message ?? "还没有开始下载安装，发现新版本后这里会显示实时进度。"}</span>
-                <strong>{Math.round(updateProgressPercent)}%</strong>
-              </div>
-              <div className="update-progress-track">
-                <div className="update-progress-fill" style={{ width: `${updateProgressPercent}%` }} />
-              </div>
-            </div>
-
-            <div className="list-block about-link-list">
-              <div className="about-link-row">
-                <span>Release 页面</span>
-                <div className="about-link-actions">
-                  <div className="path-chip subtle">{releasePageUrl}</div>
-                  <button className="ghost-button small" onClick={() => void copyTextToClipboard(releasePageUrl, "Release 链接")}>
-                    复制
-                  </button>
-                </div>
-              </div>
-              <div className="about-link-row">
-                <span>latest.json</span>
-                <div className="about-link-actions">
-                  <div className="path-chip subtle">{GITHUB_LATEST_JSON_URL}</div>
-                  <button className="ghost-button small" onClick={() => void copyTextToClipboard(GITHUB_LATEST_JSON_URL, "更新源地址")}>
-                    复制
-                  </button>
-                </div>
-              </div>
-            </div>
-
-            <div className="about-notes-block">
-              <div className="section-title compact-title">
-                <div>
-                  <p className="eyebrow">Release Notes</p>
-                  <h3>{updateInfo?.version ? `v${updateInfo.version}` : "尚未获取更新说明"}</h3>
-                </div>
-              </div>
-              <div className="about-notes">
-                <p>{updateInfo?.notes?.trim() || "当前没有额外的更新说明。你也可以直接去 GitHub Release 页面查看完整产物和标签。"}</p>
-              </div>
-            </div>
-
-            <div className="action-row about-action-row">
-              <button
-                className="primary-button"
-                disabled={isCheckingUpdate || isInstallingUpdate}
-                onClick={() => void (updateInfo?.available ? installAppUpdate() : checkAppUpdate())}
-              >
-                {aboutPrimaryLabel}
-              </button>
-              <button className="ghost-button" onClick={() => void copyTextToClipboard(appVersion || "--", "版本号")}>
-                复制版本号
-              </button>
-              <button className="ghost-button" onClick={() => closeAboutDialog()}>
-                关闭
-              </button>
-            </div>
-          </section>
-        </div>
-      ) : null}
-
-      {isConnectModalOpen ? (
-        <div className="modal-backdrop">
-          <section className="glass-panel connect-dialog" onClick={(event) => event.stopPropagation()}>
-            <div className="section-title">
-              <div>
-                <p className="eyebrow">Connection</p>
-                <h2>连接配置</h2>
-              </div>
-              <span className={`status-pill ${connection ? "live" : ""}`}>
-                {connection ? "已在线" : "待连接"}
-              </span>
-            </div>
-
-            {connectError ? (
-              <div className="form-alert error-alert">
-                <strong>连接失败</strong>
-                <span>{connectError}</span>
-              </div>
-            ) : null}
-
-            <label className={`field ${connectFieldErrors.name ? "has-error" : ""}`}>
-              <span>连接名称</span>
-              <input
-                value={form.name}
-                onChange={(event) => {
-                  const value = event.target.value;
-                  setForm((prev) => ({ ...prev, name: value }));
-                  setConnectError("");
-                  setConnectFieldErrors((prev) => ({ ...prev, name: undefined }));
-                }}
-              />
-              {connectFieldErrors.name ? <small>{connectFieldErrors.name}</small> : null}
-            </label>
-
-            <label className={`field ${connectFieldErrors.host ? "has-error" : ""}`}>
-              <span>主机地址</span>
-              <input
-                placeholder="例如 192.168.1.20 或 example.com"
-                value={form.host}
-                onChange={(event) => {
-                  const value = event.target.value;
-                  setForm((prev) => ({ ...prev, host: value }));
-                  setConnectError("");
-                  setConnectFieldErrors((prev) => ({ ...prev, host: undefined }));
-                }}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter") {
-                    event.preventDefault();
-                    void connect();
-                  }
-                }}
-              />
-              {connectFieldErrors.host ? <small>{connectFieldErrors.host}</small> : null}
-            </label>
-
-            <div className="field-row">
-              <label className={`field ${connectFieldErrors.port ? "has-error" : ""}`}>
-                <span>端口</span>
-                <input
-                  value={form.port}
-                  onChange={(event) => {
-                    const value = event.target.value;
-                    setForm((prev) => ({ ...prev, port: value }));
-                    setConnectError("");
-                    setConnectFieldErrors((prev) => ({ ...prev, port: undefined }));
-                  }}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter") {
-                      event.preventDefault();
-                      void connect();
-                    }
-                  }}
-                />
-                {connectFieldErrors.port ? <small>{connectFieldErrors.port}</small> : null}
-              </label>
-              <label className={`field ${connectFieldErrors.username ? "has-error" : ""}`}>
-                <span>用户名</span>
-                <input
-                  value={form.username}
-                  onChange={(event) => {
-                    const value = event.target.value;
-                    setForm((prev) => ({ ...prev, username: value }));
-                    setConnectError("");
-                    setConnectFieldErrors((prev) => ({ ...prev, username: undefined }));
-                  }}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter") {
-                      event.preventDefault();
-                      void connect();
-                    }
-                  }}
-                />
-                {connectFieldErrors.username ? <small>{connectFieldErrors.username}</small> : null}
-              </label>
-            </div>
-
-            <label className={`field ${connectFieldErrors.password ? "has-error" : ""}`}>
-              <span>密码</span>
-              <input
-                type="password"
-                value={form.password}
-                onChange={(event) => {
-                  const value = event.target.value;
-                  setForm((prev) => ({ ...prev, password: value }));
-                  setConnectError("");
-                  setConnectFieldErrors((prev) => ({ ...prev, password: undefined }));
-                }}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter") {
-                    event.preventDefault();
-                    void connect();
-                  }
-                }}
-              />
-              {connectFieldErrors.password ? <small>{connectFieldErrors.password}</small> : null}
-            </label>
-
-            <div className="action-row">
-              <button className="primary-button" disabled={isConnecting} onClick={() => void connect()}>
-                {isConnecting ? "连接中..." : "建立 SSH 会话"}
-              </button>
-              <button className="ghost-button" onClick={() => setIsConnectModalOpen(false)}>
-                关闭
-              </button>
-            </div>
-          </section>
-        </div>
-      ) : null}
+      <ConnectDialog
+        isOpen={isConnectModalOpen}
+        form={form}
+        connectFieldErrors={connectFieldErrors}
+        connectError={connectError}
+        connectionProgress={connectionProgress}
+        connectionProgressPercent={connectionProgressPercent}
+        connectionProgressDetail={connectionProgressDetail}
+        connectionStageLabel={connectionStageLabel}
+        activeConnectionProfile={activeConnectionProfile}
+        connectionProfiles={connectionProfiles}
+        visibleConnectionProfiles={visibleConnectionProfiles}
+        pinnedConnectionProfiles={pinnedConnectionProfiles}
+        activeProfileId={activeProfileId}
+        profileSearchQuery={profileSearchQuery}
+        isConnecting={isConnecting}
+        hasConnection={Boolean(connection)}
+        onClose={() => setIsConnectModalOpen(false)}
+        onConnect={() => {
+          void connect();
+        }}
+        onReset={() => {
+          setForm(initialConnectionForm);
+          setActiveProfileId("");
+          setConnectError("");
+          setConnectFieldErrors({});
+          setConnectionProgress(null);
+        }}
+        onDisconnect={() => {
+          void disconnect();
+        }}
+        onSaveCurrentProfile={() => {
+          saveCurrentConnectionProfile();
+        }}
+        onProfileSearchChange={setProfileSearchQuery}
+        onApplyProfile={applyConnectionProfile}
+        onTogglePin={toggleConnectionProfilePin}
+        onDeleteProfile={removeConnectionProfile}
+        onFieldChange={updateConnectField}
+        formatTime={formatUpdateCheckTime}
+      />
     </div>
   );
 }

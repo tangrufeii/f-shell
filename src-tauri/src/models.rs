@@ -134,3 +134,14 @@ pub struct TerminalStatus {
     pub kind: String,
     pub message: String,
 }
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectionProgress {
+    pub stage: String,
+    pub message: String,
+    pub detail: Option<String>,
+    pub current_step: u8,
+    pub total_steps: u8,
+    pub is_error: bool,
+}
