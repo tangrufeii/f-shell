@@ -11,6 +11,7 @@ use std::{
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use rfd::FileDialog;
+use serde::Deserialize;
 use ssh2::{FileStat, OpenFlags, OpenType, Session};
 use tauri::{AppHandle, Emitter, Manager, State};
 #[cfg(desktop)]
@@ -19,7 +20,7 @@ use url::Url;
 
 use crate::{
     models::{
-        AppUpdateInfo, AppUpdateInstallResponse, AppUpdateProgress, ConnectRequest,
+        AppUpdateFeedInfo, AppUpdateInfo, AppUpdateInstallResponse, AppUpdateProgress, ConnectRequest,
         ConnectionProgress, ConnectionSummary, DownloadResponse, FileActionResponse, FilePreview,
         RemoteEntry, SaveResponse, ShellOverview, TerminalChunk, TerminalStatus, UploadResponse,
     },
@@ -31,6 +32,13 @@ const IMAGE_PREVIEW_LIMIT: u64 = 12 * 1024 * 1024;
 const SSH_CONNECT_TIMEOUT: Duration = Duration::from_secs(6);
 const SSH_IO_TIMEOUT: Duration = Duration::from_secs(12);
 const CONNECT_TOTAL_STEPS: u8 = 5;
+
+#[tauri::command]
+pub async fn inspect_update_feed(endpoint: String) -> Result<AppUpdateFeedInfo, String> {
+    tauri::async_runtime::spawn_blocking(move || inspect_update_feed_blocking(&endpoint))
+        .await
+        .map_err(|error| format!("更新源诊断任务被中断了: {error}"))?
+}
 
 #[tauri::command]
 pub async fn check_app_update(app: AppHandle) -> Result<AppUpdateInfo, String> {
@@ -67,6 +75,57 @@ pub async fn check_app_update(app: AppHandle) -> Result<AppUpdateInfo, String> {
 
     #[allow(unreachable_code)]
     Err("当前平台不支持在线更新。".to_string())
+}
+
+fn inspect_update_feed_blocking(endpoint: &str) -> Result<AppUpdateFeedInfo, String> {
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct UpdateFeedPlatform {
+        url: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct UpdateFeedManifest {
+        version: Option<String>,
+        pub_date: Option<String>,
+        platforms: Option<std::collections::HashMap<String, UpdateFeedPlatform>>,
+    }
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(12))
+        .build()
+        .map_err(|error| format!("更新源诊断客户端初始化失败: {error}"))?;
+
+    let response = client
+        .get(endpoint)
+        .header(reqwest::header::USER_AGENT, "FShell Update Inspector")
+        .send()
+        .map_err(humanize_updater_error)?;
+
+    if !response.status().is_success() {
+        return Err(format!("更新源返回了异常状态 {}。", response.status()));
+    }
+
+    let manifest = response
+        .json::<UpdateFeedManifest>()
+        .map_err(|error| format!("更新源 latest.json 解析失败: {error}"))?;
+
+    let download_url = manifest
+        .platforms
+        .as_ref()
+        .and_then(|items| items.values().find_map(|item| item.url.clone()));
+
+    Ok(AppUpdateFeedInfo {
+        endpoint: endpoint.to_string(),
+        version: manifest.version.clone(),
+        pub_date: manifest.pub_date.clone(),
+        download_url,
+        message: manifest
+            .version
+            .as_ref()
+            .map(|version| format!("更新源当前指向 v{version}。"))
+            .unwrap_or_else(|| "更新源已响应，但 latest.json 里没带版本号。".to_string()),
+    })
 }
 
 #[tauri::command]

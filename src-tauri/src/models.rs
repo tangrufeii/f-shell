@@ -113,6 +113,16 @@ pub struct AppUpdateInstallResponse {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AppUpdateFeedInfo {
+    pub endpoint: String,
+    pub version: Option<String>,
+    pub pub_date: Option<String>,
+    pub download_url: Option<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AppUpdateProgress {
     pub stage: String,
     pub message: String,

@@ -37,6 +37,7 @@ import TerminalToolbar from "./components/TerminalToolbar";
 import TopToolbar from "./components/TopToolbar";
 import TreeContextMenu from "./components/TreeContextMenu";
 import type {
+  AppUpdateFeedInfo,
   AppUpdateInfo,
   AppUpdateInstallResponse,
   AppUpdateProgress,
@@ -1069,6 +1070,7 @@ function App() {
   const [isWindowFullscreen, setIsWindowFullscreen] = useState(false);
   const [appVersion, setAppVersion] = useState("");
   const [updateInfo, setUpdateInfo] = useState<AppUpdateInfo | null>(null);
+  const [updateFeedInfo, setUpdateFeedInfo] = useState<AppUpdateFeedInfo | null>(null);
   const [updateProgress, setUpdateProgress] = useState<AppUpdateProgress | null>(null);
   const [updateNotice, setUpdateNotice] = useState<UpdateNoticeState | null>(null);
   const [isCheckingUpdate, setIsCheckingUpdate] = useState(false);
@@ -1303,6 +1305,38 @@ function App() {
 
     void checkAppUpdate({ reason: "manual", silentNoUpdate: true });
   }, [isAboutDialogOpen, isCheckingUpdate, updateInfo]);
+
+  useEffect(() => {
+    if (!isAboutDialogOpen) {
+      return;
+    }
+
+    let cancelled = false;
+    void invoke<AppUpdateFeedInfo>("inspect_update_feed", {
+      endpoint: GITHUB_LATEST_JSON_URL
+    })
+      .then((result) => {
+        if (!cancelled) {
+          setUpdateFeedInfo(result);
+        }
+      })
+      .catch((error) => {
+        console.error(error);
+        if (!cancelled) {
+          setUpdateFeedInfo({
+            endpoint: GITHUB_LATEST_JSON_URL,
+            version: null,
+            pubDate: null,
+            downloadUrl: null,
+            message: `更新源诊断失败: ${String(error)}`
+          });
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [isAboutDialogOpen]);
 
   useEffect(() => {
     if (!updateNotice || updateNotice.sticky) {
@@ -3186,7 +3220,15 @@ function App() {
   const releaseNotesList = releaseNotesToList(updateInfo?.notes);
   const dismissedUpdateVersion = readDismissedUpdateVersion();
   const updatePublishedAtLabel = formatUpdatePubDate(updateInfo?.pubDate ?? null);
+  const updateFeedPublishedAtLabel = formatUpdatePubDate(updateFeedInfo?.pubDate ?? null);
   const lastUpdateCheckLabel = formatUpdateCheckTime(lastUpdateCheck?.checkedAt);
+  const updateFeedLagNotice =
+    appVersion &&
+    updateFeedInfo?.version &&
+    updateFeedInfo.version !== appVersion &&
+    !updateInfo?.available
+      ? `应用当前是 v${appVersion}，但更新源 latest.json 还停在 v${updateFeedInfo.version}。这通常不是客户端检查坏了，而是 GitHub Release 流水线还没把最新版本产物和清单切过去。`
+      : "";
   const updateNoticeClass = updateNotice ? `update-notice ${updateNotice.tone}` : "update-notice";
   const currentEntries = currentPath ? entriesByPath[currentPath] ?? [] : entriesByPath["/"] ?? [];
   const currentDirCount = currentEntries.filter((entry) => entry.isDir).length;
@@ -3753,6 +3795,7 @@ function App() {
         isOpen={isAboutDialogOpen}
         appVersion={appVersion}
         updateInfo={updateInfo}
+        updateFeedInfo={updateFeedInfo}
         updateProgress={updateProgress}
         updateStatusLabel={updateStatusLabel}
         publishedAtLabel={updatePublishedAtLabel}
@@ -3768,6 +3811,8 @@ function App() {
         isInstallingUpdate={isInstallingUpdate}
         aboutPrimaryLabel={aboutPrimaryLabel}
         lastCheckedAtLabel={lastUpdateCheckLabel}
+        updateFeedPublishedAtLabel={updateFeedPublishedAtLabel}
+        updateFeedLagNotice={updateFeedLagNotice}
         dismissedUpdateVersion={dismissedUpdateVersion}
         releasePageUrl={releasePageUrl}
         latestJsonUrl={GITHUB_LATEST_JSON_URL}

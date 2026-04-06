@@ -1,4 +1,4 @@
-import type { AppUpdateInfo, AppUpdateProgress } from "../types";
+import type { AppUpdateFeedInfo, AppUpdateInfo, AppUpdateProgress } from "../types";
 
 type UpdatePreferenceKey = "autoCheckOnStartup" | "showAvailableNoticeOnStartup";
 
@@ -6,6 +6,7 @@ type AboutUpdateDialogProps = {
   isOpen: boolean;
   appVersion: string | null;
   updateInfo: AppUpdateInfo | null;
+  updateFeedInfo: AppUpdateFeedInfo | null;
   updateProgress: AppUpdateProgress | null;
   updateStatusLabel: string;
   publishedAtLabel: string;
@@ -21,6 +22,8 @@ type AboutUpdateDialogProps = {
   isInstallingUpdate: boolean;
   aboutPrimaryLabel: string;
   lastCheckedAtLabel: string;
+  updateFeedPublishedAtLabel: string;
+  updateFeedLagNotice: string;
   dismissedUpdateVersion: string;
   releasePageUrl: string;
   latestJsonUrl: string;
@@ -43,6 +46,7 @@ export default function AboutUpdateDialog({
   isOpen,
   appVersion,
   updateInfo,
+  updateFeedInfo,
   updateProgress,
   updateStatusLabel,
   publishedAtLabel,
@@ -58,6 +62,8 @@ export default function AboutUpdateDialog({
   isInstallingUpdate,
   aboutPrimaryLabel,
   lastCheckedAtLabel,
+  updateFeedPublishedAtLabel,
+  updateFeedLagNotice,
   dismissedUpdateVersion,
   releasePageUrl,
   latestJsonUrl,
@@ -99,6 +105,13 @@ export default function AboutUpdateDialog({
           </div>
         )}
 
+        {updateFeedLagNotice ? (
+          <div className="form-alert update-alert">
+            <strong>更新源还没切到最新发布</strong>
+            <span>{updateFeedLagNotice}</span>
+          </div>
+        ) : null}
+
         <div className="about-grid">
           <div className="about-card">
             <span>当前版本</span>
@@ -116,9 +129,19 @@ export default function AboutUpdateDialog({
             <small>来自 updater 返回的发布时间</small>
           </div>
           <div className="about-card">
+            <span>清单版本</span>
+            <strong>{updateFeedInfo?.version ?? "--"}</strong>
+            <small>{updateFeedInfo?.message ?? "还没读取 latest.json 诊断信息。"}</small>
+          </div>
+          <div className="about-card">
             <span>更新源</span>
             <strong>GitHub Releases</strong>
             <small>latest.json + installer signatures</small>
+          </div>
+          <div className="about-card">
+            <span>清单时间</span>
+            <strong>{updateFeedPublishedAtLabel}</strong>
+            <small>{updateFeedInfo?.downloadUrl ? "latest.json 里已经带了可下载安装包地址。" : "还没从更新源里拿到安装包地址。"}</small>
           </div>
           <div className="about-card">
             <span>检查耗时</span>

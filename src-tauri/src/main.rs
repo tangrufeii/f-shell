@@ -15,6 +15,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             commands::get_shell_overview,
             commands::check_app_update,
+            commands::inspect_update_feed,
             commands::install_app_update,
             commands::connect_ssh,
             commands::disconnect_ssh,

@@ -87,6 +87,14 @@ export interface AppUpdateInstallResponse {
   message: string;
 }
 
+export interface AppUpdateFeedInfo {
+  endpoint: string;
+  version: string | null;
+  pubDate: string | null;
+  downloadUrl: string | null;
+  message: string;
+}
+
 export interface AppUpdateProgress {
   stage: string;
   message: string;

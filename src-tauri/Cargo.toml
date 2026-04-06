@@ -1,6 +1,6 @@
 [package]
 name = "fshell"
-version = "0.2.7"
+version = "0.2.8"
 description = "A modern Rust shell workspace"
 authors = ["唐如飞"]
 edition = "2021"
@@ -19,4 +19,5 @@ tauri = { version = "=2.10.3", features = [] }
 url = "2.5.4"
 
 [target."cfg(not(any(target_os = \"android\", target_os = \"ios\")))".dependencies]
+reqwest = { version = "0.12.24", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 tauri-plugin-updater = "2.10.0"
