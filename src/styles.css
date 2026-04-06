@@ -2527,6 +2527,71 @@ h3 {
   box-shadow: 0 20px 50px rgba(14, 21, 36, 0.18);
 }
 
+.markdown-preview-shell {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  overflow: auto;
+  padding: 24px 26px;
+  border-radius: 22px;
+  background: rgba(15, 24, 42, 0.88);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.markdown-preview-body {
+  width: min(860px, 100%);
+  margin: 0 auto;
+  color: rgba(248, 251, 255, 0.94);
+  line-height: 1.75;
+}
+
+.markdown-preview-body h1,
+.markdown-preview-body h2,
+.markdown-preview-body h3,
+.markdown-preview-body h4,
+.markdown-preview-body h5,
+.markdown-preview-body h6 {
+  margin: 0 0 12px;
+  color: #ffffff;
+}
+
+.markdown-preview-body p,
+.markdown-preview-body ul,
+.markdown-preview-body blockquote,
+.markdown-preview-body pre {
+  margin: 0 0 14px;
+}
+
+.markdown-preview-body ul {
+  padding-left: 22px;
+}
+
+.markdown-preview-body blockquote {
+  padding-left: 14px;
+  border-left: 3px solid rgba(112, 185, 255, 0.42);
+  color: rgba(216, 228, 246, 0.82);
+}
+
+.markdown-preview-body code {
+  padding: 0 6px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.08);
+  font-family: "SF Mono", "JetBrains Mono", Consolas, monospace;
+  font-size: 12px;
+}
+
+.markdown-preview-body pre {
+  padding: 14px 16px;
+  overflow: auto;
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.markdown-preview-body pre code {
+  padding: 0;
+  background: transparent;
+}
+
 .empty-state {
   display: grid;
   place-content: center;
@@ -2553,6 +2618,44 @@ h3 {
 .preview-state {
   min-height: 0;
   height: 100%;
+}
+
+.preview-rich-state {
+  place-content: start;
+  align-content: center;
+}
+
+.preview-facts-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  width: min(560px, 100%);
+  margin: 8px auto 0;
+}
+
+.preview-fact-card {
+  display: grid;
+  gap: 4px;
+  padding: 12px 14px;
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  text-align: left;
+}
+
+.preview-fact-card span {
+  color: var(--text-soft);
+  font-size: 11px;
+}
+
+.preview-fact-card strong {
+  color: rgba(248, 251, 255, 0.94);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.preview-fact-card.wide {
+  grid-column: 1 / -1;
 }
 
 .panel-footer {

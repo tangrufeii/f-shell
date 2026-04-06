@@ -57,6 +57,8 @@ pub struct FilePreview {
     pub content: Option<String>,
     pub readonly: bool,
     pub size: usize,
+    pub preview_bytes: usize,
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

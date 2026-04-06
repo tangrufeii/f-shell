@@ -565,10 +565,12 @@ pub fn preview_remote_file(
             content: Some(format!(
                 "data:{};base64,{}",
                 image_mime_type(&lower),
-                STANDARD.encode(bytes)
+                STANDARD.encode(&bytes)
             )),
             readonly: true,
             size: size as usize,
+            preview_bytes: bytes.len(),
+            truncated: false,
         });
     }
 
@@ -580,6 +582,8 @@ pub fn preview_remote_file(
             content: None,
             readonly: true,
             size: stat.size.unwrap_or_default() as usize,
+            preview_bytes: 0,
+            truncated: false,
         });
     }
 
@@ -597,6 +601,8 @@ pub fn preview_remote_file(
             content: None,
             readonly: true,
             size: stat.size.unwrap_or_default() as usize,
+            preview_bytes: 0,
+            truncated: false,
         });
     }
 
@@ -608,6 +614,9 @@ pub fn preview_remote_file(
         .read_to_end(&mut content)
         .map_err(|error| error.to_string())?;
 
+    let preview_bytes = content.len();
+    let truncated = stat.size.unwrap_or_default() > TEXT_PREVIEW_LIMIT;
+
     match String::from_utf8(content) {
         Ok(text) => Ok(FilePreview {
             path: path.clone(),
@@ -615,6 +624,8 @@ pub fn preview_remote_file(
             language: detect_language(&path),
             readonly: !can_write_entry(&stat, &connection),
             size: text.len(),
+            preview_bytes,
+            truncated,
             content: Some(text),
         }),
         Err(_) => Ok(FilePreview {
@@ -624,6 +635,8 @@ pub fn preview_remote_file(
             content: None,
             readonly: true,
             size: stat.size.unwrap_or_default() as usize,
+            preview_bytes: 0,
+            truncated: false,
         }),
     }
 }

@@ -38,6 +38,8 @@ export interface FilePreview {
   content: string | null;
   readonly: boolean;
   size: number;
+  previewBytes: number;
+  truncated: boolean;
 }
 
 export interface ShellOverview {

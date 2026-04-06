@@ -1119,6 +1119,7 @@ function App() {
   const [expandedPaths, setExpandedPaths] = useState<Record<string, boolean>>({});
   const [preview, setPreview] = useState<FilePreview | null>(null);
   const [previewError, setPreviewError] = useState("");
+  const [previewDisplayMode, setPreviewDisplayMode] = useState<"edit" | "read">("edit");
   const [editorContent, setEditorContent] = useState("");
   const [selectedEntry, setSelectedEntry] = useState<RemoteEntry | null>(null);
   const [statusLine, setStatusLine] = useState("等待连接");
@@ -1547,6 +1548,15 @@ function App() {
       window.clearTimeout(timer);
     };
   }, [appVersion, updatePreferences.autoCheckOnStartup]);
+
+  useEffect(() => {
+    if (preview?.kind === "Text" && preview.language === "markdown") {
+      setPreviewDisplayMode("read");
+      return;
+    }
+
+    setPreviewDisplayMode("edit");
+  }, [preview?.kind, preview?.language, preview?.path]);
 
   useEffect(() => {
     if (activeWorkspace !== "terminal") {
@@ -3254,7 +3264,7 @@ function App() {
     activeWorkspace === "terminal"
       ? statusLine
       : preview
-        ? `${preview.kind} · ${formatBytes(preview.size)}`
+        ? `${preview.kind} · ${formatBytes(preview.size)}${preview.truncated ? ` · 已截断到 ${formatBytes(preview.previewBytes)}` : ""}`
         : previewError || "点文件树里的文件就会在这里预览";
   const selectionPath = selectedEntry?.path ?? preview?.path ?? currentPath ?? "/";
   const basicStatusLabel = connection ? "已连接" : "未连接";
@@ -3713,8 +3723,12 @@ function App() {
                 {activeWorkspace === "preview" ? (
                   <PreviewWorkspaceActions
                     preview={preview}
+                    previewDisplayMode={previewDisplayMode}
                     isSaving={isSaving}
                     saveFeedback={saveFeedback}
+                    onTogglePreviewDisplayMode={() => {
+                      setPreviewDisplayMode((previous) => (previous === "read" ? "edit" : "read"));
+                    }}
                     onPasteText={() => {
                       void pasteClipboard();
                     }}
@@ -3762,6 +3776,7 @@ function App() {
                   previewError={previewError}
                   editorContent={editorContent}
                   editorLanguage={previewEditorLanguage}
+                  previewDisplayMode={previewDisplayMode}
                   isActive={activeWorkspace === "preview"}
                   accessNotice={previewAccessNotice}
                   selectedEntry={selectedEntry}
