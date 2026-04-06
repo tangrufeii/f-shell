@@ -118,6 +118,7 @@ const SIDEBAR_WIDTH_STORAGE_KEY = "fshell-sidebar-width";
 const UPDATE_DISMISSED_VERSION_STORAGE_KEY = "fshell-update-dismissed-version";
 const UPDATE_PREFERENCES_STORAGE_KEY = "fshell-update-preferences";
 const UPDATE_LAST_CHECK_STORAGE_KEY = "fshell-update-last-check";
+const UPDATE_AVAILABLE_INFO_STORAGE_KEY = "fshell-update-available-info";
 const COMMAND_HISTORY_LIMIT = 40;
 const DEFAULT_SIDEBAR_WIDTH = 460;
 const MIN_SIDEBAR_WIDTH = 360;
@@ -318,6 +319,47 @@ function readStoredUpdateCheckRecord(): UpdateCheckRecord | null {
   } catch (error) {
     console.error(error);
     return null;
+  }
+}
+
+function readStoredAvailableUpdateInfo(): AppUpdateInfo | null {
+  try {
+    const raw = window.localStorage.getItem(UPDATE_AVAILABLE_INFO_STORAGE_KEY);
+    if (!raw) {
+      return null;
+    }
+
+    const parsed = JSON.parse(raw) as Partial<AppUpdateInfo>;
+    if (!parsed.available || !parsed.version || !parsed.currentVersion || !parsed.message) {
+      return null;
+    }
+
+    return {
+      currentVersion: parsed.currentVersion,
+      available: true,
+      version: parsed.version,
+      notes: parsed.notes ?? null,
+      pubDate: parsed.pubDate ?? null,
+      target: parsed.target ?? null,
+      downloadUrl: parsed.downloadUrl ?? null,
+      message: parsed.message
+    };
+  } catch (error) {
+    console.error(error);
+    return null;
+  }
+}
+
+function persistAvailableUpdateInfo(value: AppUpdateInfo | null) {
+  try {
+    if (value?.available && value.version) {
+      window.localStorage.setItem(UPDATE_AVAILABLE_INFO_STORAGE_KEY, JSON.stringify(value));
+      return;
+    }
+
+    window.localStorage.removeItem(UPDATE_AVAILABLE_INFO_STORAGE_KEY);
+  } catch (error) {
+    console.error(error);
   }
 }
 
@@ -1069,7 +1111,7 @@ function App() {
   const [isWindowMaximized, setIsWindowMaximized] = useState(false);
   const [isWindowFullscreen, setIsWindowFullscreen] = useState(false);
   const [appVersion, setAppVersion] = useState("");
-  const [updateInfo, setUpdateInfo] = useState<AppUpdateInfo | null>(null);
+  const [updateInfo, setUpdateInfo] = useState<AppUpdateInfo | null>(() => readStoredAvailableUpdateInfo());
   const [updateFeedInfo, setUpdateFeedInfo] = useState<AppUpdateFeedInfo | null>(null);
   const [updateProgress, setUpdateProgress] = useState<AppUpdateProgress | null>(null);
   const [updateNotice, setUpdateNotice] = useState<UpdateNoticeState | null>(null);
@@ -1305,6 +1347,20 @@ function App() {
 
     void checkAppUpdate({ reason: "manual", silentNoUpdate: true });
   }, [isAboutDialogOpen, isCheckingUpdate, updateInfo]);
+
+  useEffect(() => {
+    persistAvailableUpdateInfo(updateInfo?.available ? updateInfo : null);
+  }, [updateInfo]);
+
+  useEffect(() => {
+    if (!appVersion || !updateInfo?.available) {
+      return;
+    }
+
+    if ((updateInfo.version && updateInfo.version === appVersion) || updateInfo.currentVersion !== appVersion) {
+      setUpdateInfo(null);
+    }
+  }, [appVersion, updateInfo]);
 
   useEffect(() => {
     if (!isAboutDialogOpen) {
@@ -3160,6 +3216,11 @@ function App() {
   const updateButtonTitle = updateInfo?.available
     ? [updateInfo.message, updateInfo.notes].filter(Boolean).join("\n\n")
     : `当前版本 ${appVersion || "--"}`;
+  const installUpdateButtonLabel = isInstallingUpdate
+    ? "安装中..."
+    : updateInfo?.available && updateInfo.version
+      ? `立即更新 ${updateInfo.version}`
+      : "检查更新";
   const updateProgressPercent = clampPercent(updateProgress?.progressPercent);
   const updateProgressStage = updateProgress?.stage ?? null;
   const isUpdateProgressActive = isUpdateProgressStageActive(updateProgressStage);
@@ -3438,6 +3499,8 @@ function App() {
         updateInfo={updateInfo}
         updateButtonLabel={updateButtonLabel}
         updateButtonTitle={updateButtonTitle}
+        installUpdateButtonLabel={installUpdateButtonLabel}
+        isInstallingUpdate={isInstallingUpdate}
         activeProfileId={activeProfileId}
         connectedProfileId={connectedProfileId}
         connectionProfiles={connectionProfiles}
@@ -3473,6 +3536,9 @@ function App() {
           void loadDirectory(currentPath);
         }}
         onOpenAbout={openAboutDialog}
+        onInstallUpdate={() => {
+          void installAppUpdate();
+        }}
         onToggleFullscreen={() => {
           void toggleWindowFullscreen();
         }}

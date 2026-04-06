@@ -1410,6 +1410,10 @@ h3 {
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12);
 }
 
+.toolbar-update-cta {
+  box-shadow: 0 16px 28px rgba(47, 124, 255, 0.2);
+}
+
 .primary-button:disabled,
 .ghost-button:disabled {
   cursor: not-allowed;

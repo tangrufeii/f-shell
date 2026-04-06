@@ -20,6 +20,8 @@ type TopToolbarProps = {
   updateInfo: AppUpdateInfo | null;
   updateButtonLabel: string;
   updateButtonTitle: string;
+  installUpdateButtonLabel: string;
+  isInstallingUpdate: boolean;
   activeProfileId: string;
   connectedProfileId: string;
   connectionProfiles: ConnectionProfile[];
@@ -36,6 +38,7 @@ type TopToolbarProps = {
   onGoParent: () => void;
   onRefreshDirectory: () => void;
   onOpenAbout: () => void;
+  onInstallUpdate: () => void;
   onToggleFullscreen: () => void;
   onMinimize: () => void;
   onToggleMaximize: () => void;
@@ -61,6 +64,8 @@ export default function TopToolbar({
   updateInfo,
   updateButtonLabel,
   updateButtonTitle,
+  installUpdateButtonLabel,
+  isInstallingUpdate,
   activeProfileId,
   connectedProfileId,
   connectionProfiles,
@@ -77,6 +82,7 @@ export default function TopToolbar({
   onGoParent,
   onRefreshDirectory,
   onOpenAbout,
+  onInstallUpdate,
   onToggleFullscreen,
   onMinimize,
   onToggleMaximize,
@@ -215,6 +221,11 @@ export default function TopToolbar({
         <button className="ghost-button small" disabled={!connection || !currentPath} onClick={onRefreshDirectory}>
           {isListing ? "刷新中..." : "刷新"}
         </button>
+        {updateInfo?.available ? (
+          <button className="primary-button small-primary toolbar-update-cta" disabled={isInstallingUpdate} onClick={onInstallUpdate}>
+            {installUpdateButtonLabel}
+          </button>
+        ) : null}
         <button
           className={`ghost-button small update-button ${updateInfo?.available ? "update-ready" : ""}`}
           onClick={onOpenAbout}
