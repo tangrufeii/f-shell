@@ -3234,6 +3234,8 @@ function App() {
   const currentDirCount = currentEntries.filter((entry) => entry.isDir).length;
   const currentFileCount = currentEntries.filter((entry) => !entry.isDir).length;
   const activeConnectionProfile = connectionProfiles.find((item) => item.id === activeProfileId) ?? null;
+  const matchedConnectionProfile =
+    connectionProfiles.find((item) => profileMatchesForm(item, form)) ?? null;
   const normalizedProfileSearchQuery = profileSearchQuery.trim().toLocaleLowerCase();
   const visibleConnectionProfiles = connectionProfiles.filter((profile) => {
     if (!normalizedProfileSearchQuery) {
@@ -3243,7 +3245,9 @@ function App() {
     const haystack = [profile.name, profile.host, profile.port, profile.username].join(" ").toLocaleLowerCase();
     return haystack.includes(normalizedProfileSearchQuery);
   });
+  const recentConnectionProfiles = connectionProfiles.filter((item) => item.lastUsedAt).slice(0, 4);
   const pinnedConnectionProfiles = connectionProfiles.filter((item) => item.pinned).length;
+  const connectedProfileId = connection ? activeProfileId : "";
   const connectionStageLabel = formatConnectionStage(connectionProgress?.stage);
   const connectionProgressPercent = connectionProgress
     ? clampPercent((connectionProgress.currentStep / Math.max(connectionProgress.totalSteps || 1, 1)) * 100)
@@ -3435,7 +3439,9 @@ function App() {
         updateButtonLabel={updateButtonLabel}
         updateButtonTitle={updateButtonTitle}
         activeProfileId={activeProfileId}
+        connectedProfileId={connectedProfileId}
         connectionProfiles={connectionProfiles}
+        recentConnectionProfiles={recentConnectionProfiles}
         isSavedProfilesMenuOpen={isSavedProfilesMenuOpen}
         onWindowMouseDown={(event) => {
           void startWindowDragging(event);
@@ -3849,10 +3855,13 @@ function App() {
         connectionProgressDetail={connectionProgressDetail}
         connectionStageLabel={connectionStageLabel}
         activeConnectionProfile={activeConnectionProfile}
+        matchedConnectionProfile={matchedConnectionProfile}
         connectionProfiles={connectionProfiles}
         visibleConnectionProfiles={visibleConnectionProfiles}
+        recentConnectionProfiles={recentConnectionProfiles}
         pinnedConnectionProfiles={pinnedConnectionProfiles}
         activeProfileId={activeProfileId}
+        connectedProfileId={connectedProfileId}
         profileSearchQuery={profileSearchQuery}
         isConnecting={isConnecting}
         hasConnection={Boolean(connection)}

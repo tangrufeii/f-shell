@@ -21,7 +21,9 @@ type TopToolbarProps = {
   updateButtonLabel: string;
   updateButtonTitle: string;
   activeProfileId: string;
+  connectedProfileId: string;
   connectionProfiles: ConnectionProfile[];
+  recentConnectionProfiles: ConnectionProfile[];
   isSavedProfilesMenuOpen: boolean;
   onWindowMouseDown: MouseEventHandler<HTMLDivElement>;
   onWindowDoubleClick: MouseEventHandler<HTMLDivElement>;
@@ -60,7 +62,9 @@ export default function TopToolbar({
   updateButtonLabel,
   updateButtonTitle,
   activeProfileId,
+  connectedProfileId,
   connectionProfiles,
+  recentConnectionProfiles,
   isSavedProfilesMenuOpen,
   onWindowMouseDown,
   onWindowDoubleClick,
@@ -141,6 +145,22 @@ export default function TopToolbar({
                 <strong>快速切换连接</strong>
                 <span>{connectionProfiles.length} 项</span>
               </div>
+              {recentConnectionProfiles.length ? (
+                <div className="saved-profiles-recent">
+                  {recentConnectionProfiles.map((profile) => (
+                    <button
+                      key={profile.id}
+                      className={`saved-recent-chip ${connectedProfileId === profile.id ? "connected" : activeProfileId === profile.id ? "active" : ""}`}
+                      disabled={isConnecting}
+                      onClick={() => onConnectWithProfile(profile)}
+                      title={`快速重连 ${profile.username}@${profile.host}:${profile.port}`}
+                    >
+                      <strong>{profile.name}</strong>
+                      <small>{profile.lastUsedAt ? formatTime(profile.lastUsedAt) : "未使用"}</small>
+                    </button>
+                  ))}
+                </div>
+              ) : null}
               <div className="saved-profiles-menu-actions">
                 <button className="ghost-button small" disabled={isConnecting} onClick={onSaveCurrentProfile}>
                   保存当前
@@ -161,7 +181,13 @@ export default function TopToolbar({
                     >
                       <strong>{profile.name}</strong>
                       <span>{profile.username}@{profile.host}:{profile.port}</span>
-                      <small>{profile.lastUsedAt ? `最近使用 ${formatTime(profile.lastUsedAt)}` : "点击后直接重连"}</small>
+                      <small>
+                        {connectedProfileId === profile.id
+                          ? "当前在线"
+                          : profile.lastUsedAt
+                            ? `最近使用 ${formatTime(profile.lastUsedAt)}`
+                            : "点击后直接重连"}
+                      </small>
                     </button>
                   ))}
                 </div>

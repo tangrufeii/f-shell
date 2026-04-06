@@ -22,10 +22,13 @@ type ConnectDialogProps = {
   connectionProgressDetail: string;
   connectionStageLabel: string;
   activeConnectionProfile: ConnectionProfile | null;
+  matchedConnectionProfile: ConnectionProfile | null;
   connectionProfiles: ConnectionProfile[];
   visibleConnectionProfiles: ConnectionProfile[];
+  recentConnectionProfiles: ConnectionProfile[];
   pinnedConnectionProfiles: number;
   activeProfileId: string;
+  connectedProfileId: string;
   profileSearchQuery: string;
   isConnecting: boolean;
   hasConnection: boolean;
@@ -85,10 +88,13 @@ export default function ConnectDialog({
   connectionProgressDetail,
   connectionStageLabel,
   activeConnectionProfile,
+  matchedConnectionProfile,
   connectionProfiles,
   visibleConnectionProfiles,
+  recentConnectionProfiles,
   pinnedConnectionProfiles,
   activeProfileId,
+  connectedProfileId,
   profileSearchQuery,
   isConnecting,
   hasConnection,
@@ -195,6 +201,31 @@ export default function ConnectDialog({
           </div>
 
           <aside className="connect-side-column">
+            {recentConnectionProfiles.length ? (
+              <div className="connect-side-card">
+                <div className="section-title compact-title">
+                  <div>
+                    <p className="eyebrow">快速入口</p>
+                    <h3>最近连接</h3>
+                  </div>
+                </div>
+                <div className="recent-profile-strip">
+                  {recentConnectionProfiles.map((profile) => (
+                    <button
+                      key={profile.id}
+                      className={`recent-profile-chip ${connectedProfileId === profile.id ? "connected" : activeProfileId === profile.id ? "active" : ""}`}
+                      onClick={() => onApplyProfile(profile)}
+                      title={`载入 ${profile.username}@${profile.host}:${profile.port}`}
+                    >
+                      <strong>{profile.name}</strong>
+                      <span>{profile.username}@{profile.host}:{profile.port}</span>
+                      <small>{profile.lastUsedAt ? `最近使用 ${formatTime(profile.lastUsedAt)}` : "尚未使用"}</small>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+
             <div className="connect-side-card">
               <div className="section-title compact-title">
                 <div>
@@ -225,6 +256,14 @@ export default function ConnectDialog({
                 </button>
               </div>
 
+              {matchedConnectionProfile && matchedConnectionProfile.id !== activeProfileId ? (
+                <button className="matched-profile-banner" disabled={isConnecting} onClick={() => onApplyProfile(matchedConnectionProfile)}>
+                  <strong>发现匹配配置：{matchedConnectionProfile.name}</strong>
+                  <span>{matchedConnectionProfile.username}@{matchedConnectionProfile.host}:{matchedConnectionProfile.port}</span>
+                  <small>点一下就能把当前表单切回这条保存配置，省得重复检查主机和账号。</small>
+                </button>
+              ) : null}
+
               {connectionProfiles.length ? (
                 <div className="connection-profile-list">
                   <div className="connection-profile-toolbar">
@@ -242,9 +281,16 @@ export default function ConnectDialog({
 
                   {visibleConnectionProfiles.length ? (
                     visibleConnectionProfiles.map((profile) => (
-                      <div key={profile.id} className={`connection-profile-item ${activeProfileId === profile.id ? "active" : ""}`}>
+                      <div
+                        key={profile.id}
+                        className={`connection-profile-item ${activeProfileId === profile.id ? "active" : ""} ${connectedProfileId === profile.id ? "connected" : ""}`}
+                      >
                         <button className="connection-profile-main" onClick={() => onApplyProfile(profile)}>
-                          <strong>{profile.name}</strong>
+                          <div className="connection-profile-head">
+                            <strong>{profile.name}</strong>
+                            {connectedProfileId === profile.id ? <span className="connection-profile-badge online">当前在线</span> : null}
+                            {profile.pinned ? <span className="connection-profile-badge pinned">置顶</span> : null}
+                          </div>
                           <span>{profile.username}@{profile.host}:{profile.port}</span>
                           <small>{profile.lastUsedAt ? `最近使用 ${formatTime(profile.lastUsedAt)}` : "尚未使用"}</small>
                         </button>
