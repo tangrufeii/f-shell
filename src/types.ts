@@ -126,4 +126,5 @@ export interface CommandHistoryItem {
   command: string;
   cwd: string;
   updatedAt: string;
+  favorite: boolean;
 }

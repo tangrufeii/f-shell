@@ -746,7 +746,8 @@ function sanitizeCommandHistoryItem(value: unknown): CommandHistoryItem | null {
     return {
       command,
       cwd: "/",
-      updatedAt: ""
+      updatedAt: "",
+      favorite: false
     };
   }
 
@@ -767,12 +768,19 @@ function sanitizeCommandHistoryItem(value: unknown): CommandHistoryItem | null {
   return {
     command,
     cwd: typeof candidate.cwd === "string" && candidate.cwd.trim() ? candidate.cwd.trim() : "/",
-    updatedAt: typeof candidate.updatedAt === "string" ? candidate.updatedAt : ""
+    updatedAt: typeof candidate.updatedAt === "string" ? candidate.updatedAt : "",
+    favorite: candidate.favorite === true
   };
 }
 
 function sortCommandHistory(history: CommandHistoryItem[]): CommandHistoryItem[] {
-  return [...history].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  return [...history].sort((left, right) => {
+    if (left.favorite !== right.favorite) {
+      return left.favorite ? -1 : 1;
+    }
+
+    return right.updatedAt.localeCompare(left.updatedAt);
+  });
 }
 
 function readStoredHistory(): CommandHistoryItem[] {
@@ -817,12 +825,26 @@ function pushCommandHistory(history: CommandHistoryItem[], command: string, cwd:
   const nextItem: CommandHistoryItem = {
     command: normalized,
     cwd: normalizedCwd,
-    updatedAt: new Date().toISOString()
+    updatedAt: new Date().toISOString(),
+    favorite: history.find((item) => item.command === normalized && item.cwd === normalizedCwd)?.favorite ?? false
   };
 
   return sortCommandHistory(
     [nextItem, ...history.filter((item) => !(item.command === normalized && item.cwd === normalizedCwd))]
   ).slice(0, COMMAND_HISTORY_LIMIT);
+}
+
+function toggleCommandFavorite(history: CommandHistoryItem[], command: string, cwd: string): CommandHistoryItem[] {
+  return sortCommandHistory(
+    history.map((item) =>
+      item.command === command && item.cwd === cwd
+        ? {
+            ...item,
+            favorite: !item.favorite
+          }
+        : item
+    )
+  );
 }
 
 function collectTextMatches(content: string, query: string): TextSearchMatch[] {
@@ -3334,6 +3356,7 @@ function App() {
   const searchCounterLabel = searchResultCount ? `${searchActiveIndex + 1} / ${searchResultCount}` : "0 / 0";
   const currentDirectoryPath = currentPath || connection?.homePath || "/";
   const scopedCommandHistory = commandHistory.filter((item) => item.cwd === currentDirectoryPath);
+  const favoriteCommandHistory = commandHistory.filter((item) => item.favorite);
   const connectIssue = connectError ? summarizeConnectError(connectError, form) : null;
   const previewAccessNotice =
     preview && selectedEntry && preview.path === selectedEntry.path && !selectedEntry.canWrite
@@ -3344,8 +3367,10 @@ function App() {
         }
       : null;
   const historyTriggerSummary = commandHistory.length
-    ? scopedCommandHistory.length
-      ? `最近命令 ${scopedCommandHistory.length}/${commandHistory.length}`
+    ? favoriteCommandHistory.length
+      ? `最近命令 ${favoriteCommandHistory.length}★ / ${commandHistory.length}`
+      : scopedCommandHistory.length
+        ? `最近命令 ${scopedCommandHistory.length}/${commandHistory.length}`
       : `最近命令 (${commandHistory.length})`
     : "最近命令";
   const workbenchStyle = isNarrowWorkbench
@@ -3728,6 +3753,7 @@ function App() {
                 isHistoryMenuOpen={isHistoryMenuOpen}
                 commandHistory={commandHistory}
                 scopedCommandHistory={scopedCommandHistory}
+                favoriteCommandHistory={favoriteCommandHistory}
                 historySelection={historySelection}
                 historyTriggerSummary={historyTriggerSummary}
                 currentDirectoryPath={currentDirectoryPath}
@@ -3744,6 +3770,9 @@ function App() {
                 }}
                 onCopyCommand={(command) => {
                   void copyTextToClipboard(command, "命令");
+                }}
+                onToggleFavorite={(command, cwd) => {
+                  setCommandHistory((previous) => toggleCommandFavorite(previous, command, cwd));
                 }}
                 onClearCurrentCommand={() => {
                   void clearCurrentCommand();

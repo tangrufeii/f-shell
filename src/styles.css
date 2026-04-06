@@ -2742,6 +2742,39 @@ h3 {
   color: #ffffff;
 }
 
+.history-filter-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  margin: 0 6px 8px;
+}
+
+.history-filter-input {
+  min-width: 0;
+  height: 38px;
+  padding: 0 12px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.06);
+  color: rgba(248, 251, 255, 0.94);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.history-filter-input::placeholder {
+  color: rgba(209, 221, 244, 0.44);
+}
+
+.history-filter-input:focus {
+  border-color: rgba(112, 185, 255, 0.42);
+  box-shadow: 0 0 0 3px rgba(79, 148, 255, 0.14);
+}
+
+.history-filter-meta {
+  color: var(--text-soft);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
 .history-empty-state {
   display: grid;
   gap: 6px;
@@ -2773,13 +2806,14 @@ h3 {
 
 .history-option-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr) auto auto;
   gap: 8px;
   align-items: stretch;
 }
 
 .history-option-main,
-.history-option-copy {
+.history-option-copy,
+.history-option-favorite {
   min-height: 42px;
   border-radius: 12px;
   transition: background 160ms ease, transform 160ms ease, opacity 160ms ease;
@@ -2828,6 +2862,21 @@ h3 {
 
 .history-option-copy:hover {
   background: rgba(255, 255, 255, 0.14);
+}
+
+.history-option-favorite {
+  flex: 0 0 auto;
+  min-width: 42px;
+  padding: 0 10px;
+  background: rgba(255, 255, 255, 0.06);
+  color: rgba(248, 251, 255, 0.72);
+  font-size: 16px;
+}
+
+.history-option-favorite:hover,
+.history-option-favorite.active {
+  background: rgba(255, 198, 66, 0.16);
+  color: #ffd978;
 }
 
 .history-option-command {

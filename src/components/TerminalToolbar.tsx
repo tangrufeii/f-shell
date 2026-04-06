@@ -1,4 +1,4 @@
-import { useEffect, useState, type KeyboardEvent as ReactKeyboardEvent, type Ref } from "react";
+import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type Ref } from "react";
 import type { CommandHistoryItem } from "../types";
 
 type TerminalToolbarProps = {
@@ -7,6 +7,7 @@ type TerminalToolbarProps = {
   isHistoryMenuOpen: boolean;
   commandHistory: CommandHistoryItem[];
   scopedCommandHistory: CommandHistoryItem[];
+  favoriteCommandHistory: CommandHistoryItem[];
   historySelection: string;
   historyTriggerSummary: string;
   currentDirectoryPath: string;
@@ -19,6 +20,7 @@ type TerminalToolbarProps = {
   onToggleHistoryMenu: () => void;
   onUseHistoryCommand: (command: string) => void;
   onCopyCommand: (command: string) => void;
+  onToggleFavorite: (command: string, cwd: string) => void;
   onClearCurrentCommand: () => void;
   onRequestTabCompletion: () => void;
   onExecuteTerminalCommand: () => void;
@@ -36,6 +38,7 @@ function HistorySection({
   historySelection,
   onUseHistoryCommand,
   onCopyCommand,
+  onToggleFavorite,
   formatHistoryTime
 }: {
   title: string;
@@ -43,6 +46,7 @@ function HistorySection({
   historySelection: string;
   onUseHistoryCommand: (command: string) => void;
   onCopyCommand: (command: string) => void;
+  onToggleFavorite: (command: string, cwd: string) => void;
   formatHistoryTime: (value: string) => string;
 }) {
   if (!items.length) {
@@ -71,6 +75,13 @@ function HistorySection({
           <button className="history-option-copy" onClick={() => onCopyCommand(item.command)} title="复制命令">
             复制
           </button>
+          <button
+            className={`history-option-favorite ${item.favorite ? "active" : ""}`}
+            onClick={() => onToggleFavorite(item.command, item.cwd)}
+            title={item.favorite ? "取消收藏命令" : "收藏命令"}
+          >
+            {item.favorite ? "★" : "☆"}
+          </button>
         </div>
       ))}
     </div>
@@ -83,6 +94,7 @@ export default function TerminalToolbar({
   isHistoryMenuOpen,
   commandHistory,
   scopedCommandHistory,
+  favoriteCommandHistory,
   historySelection,
   historyTriggerSummary,
   currentDirectoryPath,
@@ -95,6 +107,7 @@ export default function TerminalToolbar({
   onToggleHistoryMenu,
   onUseHistoryCommand,
   onCopyCommand,
+  onToggleFavorite,
   onClearCurrentCommand,
   onRequestTabCompletion,
   onExecuteTerminalCommand,
@@ -105,15 +118,31 @@ export default function TerminalToolbar({
   onClearTerminal,
   formatHistoryTime
 }: TerminalToolbarProps) {
-  const [historyTab, setHistoryTab] = useState<"current" | "all">("current");
+  const [historyTab, setHistoryTab] = useState<"current" | "all" | "favorites">("current");
+  const [historyQuery, setHistoryQuery] = useState("");
+  const historyQueryInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     if (isHistoryMenuOpen) {
       setHistoryTab(scopedCommandHistory.length ? "current" : "all");
+      window.setTimeout(() => {
+        historyQueryInputRef.current?.focus();
+      }, 0);
     }
   }, [isHistoryMenuOpen, scopedCommandHistory.length]);
 
-  const visibleHistory = historyTab === "current" ? scopedCommandHistory : commandHistory;
+  useEffect(() => {
+    if (!isHistoryMenuOpen) {
+      setHistoryQuery("");
+    }
+  }, [isHistoryMenuOpen]);
+
+  const tabHistory =
+    historyTab === "current" ? scopedCommandHistory : historyTab === "favorites" ? favoriteCommandHistory : commandHistory;
+  const normalizedHistoryQuery = historyQuery.trim().toLocaleLowerCase();
+  const visibleHistory = normalizedHistoryQuery
+    ? tabHistory.filter((item) => `${item.command} ${item.cwd}`.toLocaleLowerCase().includes(normalizedHistoryQuery))
+    : tabHistory;
 
   return (
     <div className="bottom-toolbar">
@@ -133,7 +162,7 @@ export default function TerminalToolbar({
               <div className="history-menu glass-panel">
                 <div className="history-menu-header">
                   <strong>最近命令</strong>
-                  <span>{scopedCommandHistory.length} 条当前目录 / {commandHistory.length} 条全部</span>
+                  <span>{favoriteCommandHistory.length} 条收藏 / {commandHistory.length} 条全部</span>
                 </div>
                 <div className="history-tabbar">
                   <button
@@ -148,20 +177,57 @@ export default function TerminalToolbar({
                   >
                     全部历史
                   </button>
+                  <button
+                    className={`history-tab ${historyTab === "favorites" ? "active" : ""}`}
+                    onClick={() => setHistoryTab("favorites")}
+                  >
+                    收藏命令
+                  </button>
+                </div>
+                <div className="history-filter-row">
+                  <input
+                    ref={historyQueryInputRef}
+                    className="history-filter-input"
+                    placeholder="搜索命令 / 目录"
+                    value={historyQuery}
+                    onChange={(event) => setHistoryQuery(event.target.value)}
+                  />
+                  <span className="history-filter-meta">{visibleHistory.length} 条</span>
                 </div>
                 {visibleHistory.length ? (
                   <HistorySection
-                    title={historyTab === "current" ? `当前目录 · ${currentDirectoryPath}` : "历史命令"}
+                    title={
+                      historyTab === "current"
+                        ? `当前目录 · ${currentDirectoryPath}`
+                        : historyTab === "favorites"
+                          ? "收藏命令"
+                          : "历史命令"
+                    }
                     items={visibleHistory}
                     historySelection={historySelection}
                     onUseHistoryCommand={onUseHistoryCommand}
                     onCopyCommand={onCopyCommand}
+                    onToggleFavorite={onToggleFavorite}
                     formatHistoryTime={formatHistoryTime}
                   />
                 ) : (
                   <div className="history-empty-state">
-                    <strong>{historyTab === "current" ? "当前目录还没命令记录" : "还没有历史命令"}</strong>
-                    <span>{historyTab === "current" ? "先在这个目录执行几条命令，这里才会有内容。" : "执行过的命令会按时间显示在这里。"}</span>
+                    <strong>
+                      {historyTab === "current"
+                        ? "当前目录还没命令记录"
+                        : historyTab === "favorites"
+                          ? "还没有收藏命令"
+                          : "还没有历史命令"}
+                    </strong>
+                    <span>
+                      {normalizedHistoryQuery
+                        ? "搜索词太刁钻了，换个关键词再试。"
+                        : historyTab === "current"
+                          ? "先在这个目录执行几条命令，这里才会有内容。"
+                          : historyTab === "favorites"
+                            ? "点右侧星标，把常用命令固定下来。"
+                            : "执行过的命令会按时间显示在这里。"}
+                    </span>
                   </div>
                 )}
               </div>
