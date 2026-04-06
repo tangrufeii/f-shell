@@ -1277,9 +1277,35 @@ h3 {
   line-height: 1.45;
 }
 
+.form-alert small {
+  color: rgba(248, 251, 255, 0.66);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
 .error-alert {
   background: rgba(255, 92, 120, 0.16);
   border: 1px solid rgba(255, 148, 168, 0.26);
+}
+
+.connect-error-tips {
+  display: grid;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.connect-error-tip {
+  padding: 8px 10px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.08);
+  color: rgba(248, 251, 255, 0.88);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.connect-error-raw {
+  margin-top: 2px;
+  word-break: break-word;
 }
 
 .about-alert {

@@ -4,11 +4,19 @@ import type { ConnectionForm, ConnectionProfile } from "../lib/connectionProfile
 
 type ConnectFieldErrors = Partial<Record<keyof ConnectionForm, string>>;
 
+type ConnectIssue = {
+  title: string;
+  summary: string;
+  tips: string[];
+  rawMessage: string;
+};
+
 type ConnectDialogProps = {
   isOpen: boolean;
   form: ConnectionForm;
   connectFieldErrors: ConnectFieldErrors;
   connectError: string;
+  connectIssue: ConnectIssue | null;
   connectionProgress: ConnectionProgress | null;
   connectionProgressPercent: number;
   connectionProgressDetail: string;
@@ -71,6 +79,7 @@ export default function ConnectDialog({
   form,
   connectFieldErrors,
   connectError,
+  connectIssue,
   connectionProgress,
   connectionProgressPercent,
   connectionProgressDetail,
@@ -121,8 +130,18 @@ export default function ConnectDialog({
 
         {connectError ? (
           <div className="form-alert error-alert">
-            <strong>连接失败</strong>
-            <span>{connectError}</span>
+            <strong>{connectIssue?.title ?? "连接失败"}</strong>
+            <span>{connectIssue?.summary ?? connectError}</span>
+            {connectIssue?.tips?.length ? (
+              <div className="connect-error-tips">
+                {connectIssue.tips.map((tip) => (
+                  <div key={tip} className="connect-error-tip">
+                    {tip}
+                  </div>
+                ))}
+              </div>
+            ) : null}
+            {connectIssue ? <small className="connect-error-raw">{connectIssue.rawMessage}</small> : null}
           </div>
         ) : null}
 

@@ -105,6 +105,12 @@ type SaveFeedbackState = {
   message: string;
 };
 type EntryAccessState = "writable" | "readonly" | "blocked";
+type ConnectIssueState = {
+  title: string;
+  summary: string;
+  tips: string[];
+  rawMessage: string;
+};
 
 const COMMAND_HISTORY_STORAGE_KEY = "fshell-command-history";
 const SIDEBAR_WIDTH_STORAGE_KEY = "fshell-sidebar-width";
@@ -461,6 +467,95 @@ function resolveDownloadTarget(entry: RemoteEntry | null, targetDir: string) {
     remotePath: targetDir,
     suggestedName: remotePathBaseName(targetDir),
     isDir: true
+  };
+}
+
+function summarizeConnectError(rawMessage: string, form: ConnectionForm): ConnectIssueState {
+  const message = rawMessage.trim();
+  const lower = message.toLowerCase();
+  const host = form.host.trim() || "目标主机";
+  const port = form.port.trim() || "22";
+  const username = form.username.trim() || "当前用户";
+
+  const rawLine = message.includes("原始错误：") ? message : `原始信息：${message}`;
+
+  if (message.includes("解析主机") || message.includes("没解析出可用地址")) {
+    return {
+      title: "主机地址解析失败",
+      summary: `系统没法把 ${host} 解析成可连接地址，当前连 TCP 都还没开始。`,
+      tips: ["检查主机名是不是写错了", "如果是内网机器，确认 DNS / hosts / VPN 已经生效", "也可以直接改填 IP 再试一次"],
+      rawMessage: rawLine
+    };
+  }
+
+  if (message.includes("被拒绝")) {
+    return {
+      title: "端口能到，但 SSH 服务没接住",
+      summary: `${host}:${port} 已经有响应，但服务端直接拒绝了这次 TCP 连接。`,
+      tips: ["检查端口是不是填错了", "确认服务器 SSH 服务已启动", "如果机器在线但端口不对，换成真实 SSH 端口再试"],
+      rawMessage: rawLine
+    };
+  }
+
+  if (message.includes("TCP 连接") && message.includes("超时")) {
+    return {
+      title: "TCP 连接超时",
+      summary: `客户端在限定时间内没连上 ${host}:${port}，通常是网络、防火墙或目标主机不可达。`,
+      tips: ["先 ping 或 telnet 目标主机和端口", "检查安全组、防火墙、端口映射", "如果是公司网络，确认代理 / VPN 没拦住这条链路"],
+      rawMessage: rawLine
+    };
+  }
+
+  if (message.includes("banner") || message.includes("不是 SSH")) {
+    return {
+      title: "目标端口不像 SSH",
+      summary: `${host}:${port} 有服务在响应，但它返回的协议内容不像 SSH。`,
+      tips: ["确认端口不是 HTTP、数据库或别的服务", "检查服务器 SSH 监听端口", "如果走了跳板或反代，确认链路没配错"],
+      rawMessage: rawLine
+    };
+  }
+
+  if (message.includes("SSH 握手") && (message.includes("超时") || lower.includes("timeout"))) {
+    return {
+      title: "SSH 握手超时",
+      summary: `TCP 已经接通，但 SSH 协议握手没在时限内完成，服务端或链路状态不太对劲。`,
+      tips: ["稍后重试，排除服务端瞬时负载过高", "检查是否有安全设备在拦截 SSH 握手", "确认目标主机不是卡在登录前脚本或速率限制"],
+      rawMessage: rawLine
+    };
+  }
+
+  if (message.includes("账号或密码不对") || lower.includes("authentication failed")) {
+    return {
+      title: "账号或密码不对",
+      summary: `SSH 服务已经通了，但用户 ${username} 的认证没通过。`,
+      tips: ["重新确认用户名和密码大小写", "检查该账号是否被禁用或锁定", "如果服务器禁止密码登录，就得换成它允许的登录方式"],
+      rawMessage: rawLine
+    };
+  }
+
+  if (message.includes("鉴权超时")) {
+    return {
+      title: "登录认证超时",
+      summary: `用户 ${username} 的认证请求没能在限定时间内完成，通常是网络慢或服务端负载高。`,
+      tips: ["先重试一次，排除临时抖动", "检查服务端是否有 MFA / PAM / 安全策略拖慢登录", "如果跨境或跨地域连接，先确认网络链路质量"],
+      rawMessage: rawLine
+    };
+  }
+
+  if (message.includes("SSH 鉴权失败")) {
+    return {
+      title: "SSH 认证没通过",
+      summary: `目标主机拒绝了用户 ${username} 的登录请求。`,
+      tips: ["先确认用户名和密码", "检查账号是否允许 SSH 登录", "如果服务端限制了认证方式，需要改成服务端支持的方案"],
+      rawMessage: rawLine
+    };
+  }
+
+  return {
+    title: "连接失败",
+    summary: "连接链路某一步挂了，但不是最常见那几类错误。先看下面原始信息，再按网络、端口、认证顺序排查。",
+    tips: ["先确认主机和端口", "再确认账号密码", "最后检查目标机器 SSH 服务和网络策略"],
+    rawMessage: rawLine
   };
 }
 
@@ -3132,6 +3227,7 @@ function App() {
   const searchCounterLabel = searchResultCount ? `${searchActiveIndex + 1} / ${searchResultCount}` : "0 / 0";
   const currentDirectoryPath = currentPath || connection?.homePath || "/";
   const scopedCommandHistory = commandHistory.filter((item) => item.cwd === currentDirectoryPath);
+  const connectIssue = connectError ? summarizeConnectError(connectError, form) : null;
   const previewAccessNotice =
     preview && selectedEntry && preview.path === selectedEntry.path && !selectedEntry.canWrite
       ? {
@@ -3702,6 +3798,7 @@ function App() {
         form={form}
         connectFieldErrors={connectFieldErrors}
         connectError={connectError}
+        connectIssue={connectIssue}
         connectionProgress={connectionProgress}
         connectionProgressPercent={connectionProgressPercent}
         connectionProgressDetail={connectionProgressDetail}
