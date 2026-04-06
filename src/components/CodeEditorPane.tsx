@@ -29,6 +29,7 @@ type CodeEditorPaneProps = {
   onMount: (editor: MonacoEditor.IStandaloneCodeEditor) => void;
   onSave: () => void | Promise<void>;
   path: string;
+  readOnly?: boolean;
   value: string;
 };
 
@@ -71,6 +72,7 @@ export default function CodeEditorPane({
   onMount,
   onSave,
   path,
+  readOnly = false,
   value
 }: CodeEditorPaneProps) {
   const [isLanguageReady, setIsLanguageReady] = useState(() => loadedEditorLanguages.has(language));
@@ -122,7 +124,7 @@ export default function CodeEditorPane({
         lineNumbers: "on",
         minimap: { enabled: false },
         padding: { top: 16, bottom: 16 },
-        readOnly: false,
+        readOnly,
         roundedSelection: true,
         scrollBeyondLastLine: false,
         smoothScrolling: true,

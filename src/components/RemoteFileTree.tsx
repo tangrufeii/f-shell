@@ -6,6 +6,7 @@ type RemoteFileTreeProps = {
   summaryLabel: string;
   hasConnection: boolean;
   hasRootEntries: boolean;
+  legend?: ReactNode;
   treeNodes: ReactNode;
   onRootDragOver: DragEventHandler<HTMLDivElement>;
   onRootDragLeave: DragEventHandler<HTMLDivElement>;
@@ -19,6 +20,7 @@ export default function RemoteFileTree({
   summaryLabel,
   hasConnection,
   hasRootEntries,
+  legend,
   treeNodes,
   onRootDragOver,
   onRootDragLeave,
@@ -41,6 +43,7 @@ export default function RemoteFileTree({
               <span>{summaryLabel}</span>
             </div>
             <div className="tree-drop-hint">支持拖拽上传、粘贴图片和 Windows 文件粘贴。</div>
+            {legend ? <div className="tree-legend">{legend}</div> : null}
             {treeNodes}
           </>
         ) : (

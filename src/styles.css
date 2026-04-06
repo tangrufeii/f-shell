@@ -1955,6 +1955,48 @@ h3 {
   line-height: 1.45;
 }
 
+.tree-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 0 12px 10px;
+}
+
+.tree-legend-item,
+.entry-access-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 22px;
+  padding: 0 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  line-height: 1;
+  white-space: nowrap;
+  border: 1px solid transparent;
+}
+
+.tree-legend-item.writable,
+.entry-access-badge.writable {
+  background: rgba(74, 222, 128, 0.16);
+  color: #e6fff0;
+  border-color: rgba(103, 236, 149, 0.22);
+}
+
+.tree-legend-item.readonly,
+.entry-access-badge.readonly {
+  background: rgba(255, 198, 66, 0.16);
+  color: #fff3d0;
+  border-color: rgba(255, 216, 124, 0.22);
+}
+
+.tree-legend-item.blocked,
+.entry-access-badge.blocked {
+  background: rgba(255, 92, 120, 0.16);
+  color: #ffe3ea;
+  border-color: rgba(255, 132, 156, 0.22);
+}
+
 .file-row {
   display: grid;
   grid-template-columns: 56px minmax(0, 1fr) auto;
@@ -1991,19 +2033,20 @@ h3 {
   background: rgba(102, 193, 255, 0.2);
 }
 
-.tree-row.restricted {
-  opacity: 0.5;
+.tree-row.access-readonly {
+  background: rgba(255, 198, 66, 0.06);
 }
 
-.tree-row.restricted .tree-name,
-.tree-row.restricted .tree-submeta,
-.tree-row.restricted .file-meta,
-.tree-row.restricted .tree-toggle {
-  color: rgba(248, 251, 255, 0.46);
+.tree-row.access-blocked {
+  opacity: 0.74;
+  background: rgba(255, 92, 120, 0.04);
 }
 
-.tree-row.restricted .file-icon {
-  filter: grayscale(0.55) saturate(0.72);
+.tree-row.access-blocked .tree-name,
+.tree-row.access-blocked .tree-submeta,
+.tree-row.access-blocked .file-meta,
+.tree-row.access-blocked .tree-toggle {
+  color: rgba(248, 251, 255, 0.5);
 }
 
 .tree-context-menu {
@@ -2108,6 +2151,13 @@ h3 {
   min-width: 0;
 }
 
+.tree-main-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
 .file-icon {
   display: inline-flex;
   align-items: center;
@@ -2126,6 +2176,20 @@ h3 {
   background: linear-gradient(180deg, rgba(144, 219, 255, 0.88), rgba(57, 155, 255, 0.92));
 }
 
+.file-icon.readonly {
+  filter: saturate(0.82) brightness(0.94);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.16),
+    0 0 0 1px rgba(255, 198, 66, 0.28);
+}
+
+.file-icon.blocked {
+  filter: grayscale(0.52) saturate(0.72);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.08),
+    0 0 0 1px rgba(255, 92, 120, 0.18);
+}
+
 .file-name {
   text-align: left;
   overflow: hidden;
@@ -2134,6 +2198,7 @@ h3 {
 }
 
 .tree-name {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -2168,6 +2233,42 @@ h3 {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.preview-content-stack {
+  display: grid;
+  gap: 10px;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+}
+
+.preview-access-banner {
+  display: grid;
+  gap: 4px;
+  padding: 12px 14px;
+  border-radius: 16px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+}
+
+.preview-access-banner strong {
+  font-size: 13px;
+}
+
+.preview-access-banner span {
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.preview-access-banner.warning {
+  background: rgba(255, 198, 66, 0.16);
+  border-color: rgba(255, 216, 124, 0.22);
+}
+
+.preview-access-banner.error {
+  background: rgba(255, 92, 120, 0.16);
+  border-color: rgba(255, 132, 156, 0.22);
 }
 
 .editor-shell {

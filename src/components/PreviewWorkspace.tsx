@@ -9,6 +9,12 @@ type SaveFeedback = {
   message: string;
 };
 
+type PreviewAccessNotice = {
+  tone: "warning" | "error";
+  title: string;
+  message: string;
+};
+
 type PreviewWorkspaceProps = {
   preview: FilePreview | null;
   previewError: string;
@@ -16,6 +22,7 @@ type PreviewWorkspaceProps = {
   editorLanguage: string;
   isActive: boolean;
   isSaving: boolean;
+  accessNotice: PreviewAccessNotice | null;
   saveFeedback: SaveFeedback | null;
   selectedEntry: RemoteEntry | null;
   selectionPath: string;
@@ -33,17 +40,18 @@ export function PreviewWorkspaceActions({
   onSave
 }: Pick<PreviewWorkspaceProps, "preview" | "isSaving" | "saveFeedback" | "onPasteText" | "onSave">) {
   const saveFeedbackClass = saveFeedback ? `status-pill save-feedback-pill ${saveFeedback.tone}` : "status-pill save-feedback-pill";
+  const isReadOnly = Boolean(preview?.readonly);
 
   return (
     <>
-      <button className="ghost-button small" disabled={!preview || preview.kind !== "Text"} onClick={onPasteText}>
+      <button className="ghost-button small" disabled={!preview || preview.kind !== "Text" || isReadOnly} onClick={onPasteText}>
         贴文本
       </button>
       <button
         className="primary-button small-primary"
-        disabled={!preview || preview.kind !== "Text" || isSaving}
+        disabled={!preview || preview.kind !== "Text" || isSaving || isReadOnly}
         onClick={onSave}
-        title="Ctrl + S"
+        title={isReadOnly ? "当前文件为只读，不能保存" : "Ctrl + S"}
       >
         {isSaving ? "保存中..." : "保存"}
       </button>
@@ -58,6 +66,7 @@ export default function PreviewWorkspace({
   editorContent,
   editorLanguage,
   isActive,
+  accessNotice,
   selectedEntry,
   selectionPath,
   onSave,
@@ -75,33 +84,50 @@ export default function PreviewWorkspace({
     }
 
     return (
-      <div className="editor-shell">
-        <Suspense
-          fallback={
-            <div className="editor-loading">
-              <strong>编辑器加载中</strong>
-              <p>正在初始化代码编辑器和语法高亮。</p>
-            </div>
-          }
-        >
-          <LazyCodeEditor
-            className="editor"
-            language={editorLanguage}
-            onChange={onEditorChange}
-            onMount={onEditorMount}
-            onSave={onSave}
-            path={preview.path}
-            value={editorContent}
-          />
-        </Suspense>
+      <div className="preview-content-stack">
+        {accessNotice ? (
+          <div className={`preview-access-banner ${accessNotice.tone}`}>
+            <strong>{accessNotice.title}</strong>
+            <span>{accessNotice.message}</span>
+          </div>
+        ) : null}
+        <div className="editor-shell">
+          <Suspense
+            fallback={
+              <div className="editor-loading">
+                <strong>编辑器加载中</strong>
+                <p>正在初始化代码编辑器和语法高亮。</p>
+              </div>
+            }
+          >
+            <LazyCodeEditor
+              className="editor"
+              language={editorLanguage}
+              onChange={onEditorChange}
+              onMount={onEditorMount}
+              onSave={onSave}
+              path={preview.path}
+              readOnly={preview.readonly}
+              value={editorContent}
+            />
+          </Suspense>
+        </div>
       </div>
     );
   }
 
   if (preview?.kind === "Image" && preview.content) {
     return (
-      <div className="image-preview-shell">
-        <img className="image-preview" src={preview.content} alt={preview.path} />
+      <div className="preview-content-stack">
+        {accessNotice ? (
+          <div className={`preview-access-banner ${accessNotice.tone}`}>
+            <strong>{accessNotice.title}</strong>
+            <span>{accessNotice.message}</span>
+          </div>
+        ) : null}
+        <div className="image-preview-shell">
+          <img className="image-preview" src={preview.content} alt={preview.path} />
+        </div>
       </div>
     );
   }

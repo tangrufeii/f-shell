@@ -104,6 +104,7 @@ type SaveFeedbackState = {
   tone: "success" | "error";
   message: string;
 };
+type EntryAccessState = "writable" | "readonly" | "blocked";
 
 const COMMAND_HISTORY_STORAGE_KEY = "fshell-command-history";
 const SIDEBAR_WIDTH_STORAGE_KEY = "fshell-sidebar-width";
@@ -340,25 +341,78 @@ function canPreviewEntry(entry: RemoteEntry): boolean {
   return entry.canRead;
 }
 
+function getEntryAccessState(entry: RemoteEntry): EntryAccessState {
+  if (entry.isDir) {
+    if (!entry.canRead || !entry.canEnter) {
+      return "blocked";
+    }
+
+    return entry.canWrite ? "writable" : "readonly";
+  }
+
+  if (!entry.canRead) {
+    return "blocked";
+  }
+
+  return entry.canWrite ? "writable" : "readonly";
+}
+
 function entryAccessLabel(entry: RemoteEntry): string {
   if (entry.isDir) {
-    if (!canOpenDirectory(entry)) {
-      return "无权限";
+    if (!entry.canRead && !entry.canEnter) {
+      return "不可读取/进入";
     }
-    if (!entry.canWrite) {
-      return "可能只读";
+    if (!entry.canRead) {
+      return "不可读取";
     }
-    return "可访问";
+    if (!entry.canEnter) {
+      return "不可进入";
+    }
+    return entry.canWrite ? "可读写" : "只读目录";
   }
 
   if (!canPreviewEntry(entry)) {
     return "不可读取";
   }
-  if (!entry.canWrite) {
-    return "可能只读";
+
+  return entry.canWrite ? "可读写" : "只读文件";
+}
+
+function entryAccessBadgeLabel(entry: RemoteEntry): string {
+  const state = getEntryAccessState(entry);
+  if (state === "blocked") {
+    return entry.isDir ? "受限" : "不可读";
   }
 
-  return "可读写";
+  return state === "readonly" ? "只读" : "可写";
+}
+
+function entryAccessHint(entry: RemoteEntry): string {
+  if (entry.isDir) {
+    if (!entry.canRead && !entry.canEnter) {
+      return "当前账号既不能读取目录内容，也不能进入该目录。";
+    }
+    if (!entry.canRead) {
+      return "当前账号不能读取这个目录下的内容。";
+    }
+    if (!entry.canEnter) {
+      return "当前账号不能进入该目录。";
+    }
+    if (!entry.canWrite) {
+      return "当前账号可以浏览目录，但没有写入权限。";
+    }
+    return "当前账号可以进入、读取并写入这个目录。";
+  }
+
+  if (!entry.canRead) {
+    return "当前账号不能读取这个文件。";
+  }
+
+  if (!entry.canWrite) {
+    return "当前账号可以查看这个文件，但不能覆盖保存。";
+  }
+
+  return "当前账号可以读取并修改这个文件。";
 }
 
 function resolveUploadTargetDir(entry: RemoteEntry | null, fallbackPath: string): string {
@@ -2404,6 +2458,11 @@ function App() {
       return;
     }
 
+    if (preview.readonly) {
+      setStatusLine(`文件 ${preview.path} 当前为只读，不能保存覆盖。`);
+      return;
+    }
+
     setIsSaving(true);
     try {
       const result = await invoke<SaveResponse>("save_remote_file", {
@@ -2907,11 +2966,15 @@ function App() {
     return entries.flatMap((entry) => {
       const expanded = Boolean(expandedPaths[entry.path]);
       const dropTargetDir = resolveUploadTargetDir(entry, currentPath || "/");
+      const accessState = getEntryAccessState(entry);
+      const accessLabel = entryAccessLabel(entry);
+      const accessBadge = entryAccessBadgeLabel(entry);
+      const accessHint = entryAccessHint(entry);
       const children = entry.isDir && expanded ? renderTree(entry.path, level + 1) : [];
 
       return [
         <button
-          className={`tree-row ${currentPath === entry.path ? "active" : ""} ${dragTargetPath === dropTargetDir ? "drag-over" : ""} ${(!entry.canRead || (entry.isDir && !entry.canEnter)) ? "restricted" : ""}`}
+          className={`tree-row ${currentPath === entry.path ? "active" : ""} ${dragTargetPath === dropTargetDir ? "drag-over" : ""} access-${accessState}`}
           key={entry.path}
           onClick={() => void openEntry(entry)}
           onContextMenu={(event) =>
@@ -2926,14 +2989,17 @@ function App() {
           onDragLeave={(event) => handleTreeDragLeave(event, dropTargetDir)}
           onDrop={(event) => void handleTreeDrop(event, entry)}
           style={{ paddingLeft: `${16 + level * 18}px` }}
-          title={`${entry.isDir ? `拖文件到这里，上传到 ${entry.path}` : `拖文件到这里，上传到 ${dropTargetDir}`} · ${entryAccessLabel(entry)} · 权限 ${formatPermissions(entry.permissions)}`}
+          title={`${entry.isDir ? `拖文件到这里，上传到 ${entry.path}` : `拖文件到这里，上传到 ${dropTargetDir}`} · ${accessLabel} · ${accessHint} · 权限 ${formatPermissions(entry.permissions)}`}
         >
           <span className="tree-toggle">{entry.isDir ? (expanded ? "▾" : "▸") : ""}</span>
-          <span className={`file-icon ${entry.isDir ? "dir" : "file"}`} aria-hidden="true" />
+          <span className={`file-icon ${entry.isDir ? "dir" : "file"} ${accessState}`} aria-hidden="true" />
           <span className="tree-main">
-            <span className="tree-name">{entry.name}</span>
+            <span className="tree-main-head">
+              <span className="tree-name">{entry.name}</span>
+              <span className={`entry-access-badge ${accessState}`}>{accessBadge}</span>
+            </span>
             <span className="tree-submeta">
-              {entry.isDir ? "目录" : "文件"} · {entryAccessLabel(entry)} · {formatModifiedAt(entry.modifiedAt)}
+              {entry.isDir ? "目录" : "文件"} · {accessLabel} · {formatModifiedAt(entry.modifiedAt)}
             </span>
           </span>
           <span className="file-meta">{entry.isDir ? formatPermissions(entry.permissions) : `${formatBytes(entry.size)} · ${formatPermissions(entry.permissions)}`}</span>
@@ -3066,6 +3132,14 @@ function App() {
   const searchCounterLabel = searchResultCount ? `${searchActiveIndex + 1} / ${searchResultCount}` : "0 / 0";
   const currentDirectoryPath = currentPath || connection?.homePath || "/";
   const scopedCommandHistory = commandHistory.filter((item) => item.cwd === currentDirectoryPath);
+  const previewAccessNotice =
+    preview && selectedEntry && preview.path === selectedEntry.path && !selectedEntry.canWrite
+      ? {
+          tone: "warning" as const,
+          title: "当前文件是只读预览",
+          message: "这个 SSH 账号可以查看内容，但没有写入权限，保存和粘贴修改都已禁用。"
+        }
+      : null;
   const historyTriggerSummary = commandHistory.length
     ? scopedCommandHistory.length
       ? `最近命令 ${scopedCommandHistory.length}/${commandHistory.length}`
@@ -3318,6 +3392,13 @@ function App() {
             summaryLabel={isUploading ? "上传中..." : `${currentDirCount} 个目录 · ${currentFileCount} 个文件`}
             hasConnection={Boolean(connection)}
             hasRootEntries={Boolean(entriesByPath["/"]?.length)}
+            legend={
+              <>
+                <span className="tree-legend-item writable">可写</span>
+                <span className="tree-legend-item readonly">只读</span>
+                <span className="tree-legend-item blocked">受限</span>
+              </>
+            }
             treeNodes={renderTree("/")}
             onRootDragOver={(event) => handleTreeDragOver(event, currentPath || connection?.homePath || "/")}
             onRootDragLeave={(event) => handleTreeDragLeave(event, currentPath || connection?.homePath || "/")}
@@ -3418,6 +3499,7 @@ function App() {
                   editorContent={editorContent}
                   editorLanguage={previewEditorLanguage}
                   isActive={activeWorkspace === "preview"}
+                  accessNotice={previewAccessNotice}
                   selectedEntry={selectedEntry}
                   selectionPath={selectionPath}
                   onSave={() => {
