@@ -1460,6 +1460,10 @@ h3 {
   box-shadow: 0 16px 28px rgba(47, 124, 255, 0.2);
 }
 
+.toolbar-check-update-button {
+  border-color: rgba(112, 185, 255, 0.22);
+}
+
 .primary-button:disabled,
 .ghost-button:disabled {
   cursor: not-allowed;

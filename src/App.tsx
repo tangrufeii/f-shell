@@ -3280,6 +3280,7 @@ function App() {
     : updateInfo?.available && updateInfo.version
       ? `立即更新 ${updateInfo.version}`
       : "检查更新";
+  const checkUpdateButtonLabel = isCheckingUpdate ? "检查中..." : "检查更新";
   const updateProgressPercent = clampPercent(updateProgress?.progressPercent);
   const updateProgressStage = updateProgress?.stage ?? null;
   const isUpdateProgressActive = isUpdateProgressStageActive(updateProgressStage);
@@ -3563,6 +3564,8 @@ function App() {
         updateButtonLabel={updateButtonLabel}
         updateButtonTitle={updateButtonTitle}
         installUpdateButtonLabel={installUpdateButtonLabel}
+        checkUpdateButtonLabel={checkUpdateButtonLabel}
+        isCheckingUpdate={isCheckingUpdate}
         isInstallingUpdate={isInstallingUpdate}
         activeProfileId={activeProfileId}
         connectedProfileId={connectedProfileId}
@@ -3600,6 +3603,9 @@ function App() {
           void loadDirectory(currentPath);
         }}
         onOpenAbout={openAboutDialog}
+        onCheckUpdate={() => {
+          void checkAppUpdate({ reason: "manual" });
+        }}
         onInstallUpdate={() => {
           void installAppUpdate();
         }}
