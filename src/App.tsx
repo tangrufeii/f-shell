@@ -1,5 +1,7 @@
 import {
+  useDeferredValue,
   useEffect,
+  useMemo,
   useRef,
   useState,
   type DragEvent as ReactDragEvent,
@@ -14,9 +16,11 @@ import { FitAddon } from "@xterm/addon-fit";
 import type { editor as MonacoEditor } from "monaco-editor";
 import {
   buildConnectionProfile,
+  clearStoredProfilePassword,
   initialConnectionForm,
   persistActiveProfileId,
   persistConnectionDraft,
+  persistProfilePassword,
   persistConnectionProfiles,
   profileMatchesForm,
   readStoredActiveProfileId,
@@ -26,13 +30,16 @@ import {
   toFormFromProfile,
   upsertConnectionProfile,
   type ConnectionForm,
-  type ConnectionProfile
+  type ConnectionProfile,
+  type PasswordStorageMode
 } from "./lib/connectionProfiles";
 import PreviewWorkspace, { PreviewWorkspaceActions } from "./components/PreviewWorkspace";
 import FileActionDialog from "./components/FileActionDialog";
 import AboutUpdateDialog from "./components/AboutUpdateDialog";
 import ConnectDialog from "./components/ConnectDialog";
-import RemoteFileTree from "./components/RemoteFileTree";
+import HostRuntimeSection from "./components/HostRuntimeSection";
+import PasswordStorageDialog from "./components/PasswordStorageDialog";
+import RemoteFileTree, { type RemoteFileTreeNode } from "./components/RemoteFileTree";
 import TerminalToolbar from "./components/TerminalToolbar";
 import TopToolbar from "./components/TopToolbar";
 import TreeContextMenu from "./components/TreeContextMenu";
@@ -63,6 +70,14 @@ type ConnectFieldErrors = Partial<Record<keyof ConnectionForm, string>>;
 type FileActionMode = "new-file" | "new-directory" | "rename" | "delete";
 type FileActionErrors = {
   name?: string;
+};
+type PasswordStorageDialogState = {
+  source: "settings" | "save-profile";
+  saveOptions?: {
+    silent?: boolean;
+    formOverride?: ConnectionForm;
+    profileIdOverride?: string;
+  };
 };
 type TreeContextMenuState = {
   x: number;
@@ -101,6 +116,7 @@ type UpdateCheckRecord = {
   version?: string | null;
   message: string;
 };
+type AppThemeMode = "system" | "aurora" | "light" | "dark";
 type SaveFeedbackState = {
   tone: "success" | "error";
   message: string;
@@ -115,6 +131,7 @@ type ConnectIssueState = {
 
 const COMMAND_HISTORY_STORAGE_KEY = "fshell-command-history";
 const SIDEBAR_WIDTH_STORAGE_KEY = "fshell-sidebar-width";
+const THEME_STORAGE_KEY = "fshell-theme-mode";
 const UPDATE_DISMISSED_VERSION_STORAGE_KEY = "fshell-update-dismissed-version";
 const UPDATE_PREFERENCES_STORAGE_KEY = "fshell-update-preferences";
 const UPDATE_LAST_CHECK_STORAGE_KEY = "fshell-update-last-check";
@@ -124,6 +141,7 @@ const DEFAULT_SIDEBAR_WIDTH = 460;
 const MIN_SIDEBAR_WIDTH = 360;
 const MAX_SIDEBAR_WIDTH = 760;
 const NARROW_LAYOUT_BREAKPOINT = 1320;
+const SYSTEM_SNAPSHOT_POLL_INTERVAL_MS = 1000;
 const GITHUB_RELEASES_PAGE_URL = "https://github.com/tangrufeii/f-shell/releases";
 const GITHUB_LATEST_JSON_URL = `${GITHUB_RELEASES_PAGE_URL}/latest/download/latest.json`;
 const WINDOW_RESIZE_DIRECTIONS: ResizeDirection[] = [
@@ -159,6 +177,55 @@ function readStoredSidebarWidth(): number {
     console.error(error);
     return DEFAULT_SIDEBAR_WIDTH;
   }
+}
+
+function readStoredThemeMode(): AppThemeMode {
+  try {
+    const raw = window.localStorage.getItem(THEME_STORAGE_KEY);
+    return raw === "system" || raw === "light" || raw === "dark" ? raw : "aurora";
+  } catch (error) {
+    console.error(error);
+    return "aurora";
+  }
+}
+
+function resolveAppliedThemeMode(themeMode: AppThemeMode): "aurora" | "light" | "dark" {
+  if (themeMode !== "system") {
+    return themeMode;
+  }
+
+  if (typeof window !== "undefined" && window.matchMedia?.("(prefers-color-scheme: dark)").matches) {
+    return "dark";
+  }
+
+  return "light";
+}
+
+function resolveTerminalTheme(themeMode: AppThemeMode) {
+  if (themeMode === "light") {
+    return {
+      background: "#f7f8fb",
+      foreground: "#152033",
+      cursor: "#1f2a3d",
+      selectionBackground: "rgba(63, 110, 197, 0.18)"
+    };
+  }
+
+  if (themeMode === "dark") {
+    return {
+      background: "#0d1117",
+      foreground: "#e6edf3",
+      cursor: "#ffffff",
+      selectionBackground: "rgba(115, 164, 255, 0.2)"
+    };
+  }
+
+  return {
+    background: "rgba(10, 18, 35, 0.02)",
+    foreground: "#f7fbff",
+    cursor: "#ffffff",
+    selectionBackground: "rgba(255,255,255,0.18)"
+  };
 }
 
 function resolveEditorLanguage(language: string | null | undefined): string {
@@ -938,12 +1005,13 @@ function isReasonableCommandText(command: string): boolean {
   return /^[\x20-\x7e\u4e00-\u9fff]*$/.test(command);
 }
 
-function validateConnectForm(form: ConnectionForm): ConnectFieldErrors {
+function validateConnectForm(form: ConnectionForm, options?: { requirePassword?: boolean }): ConnectFieldErrors {
   const errors: ConnectFieldErrors = {};
   const host = form.host.trim();
   const username = form.username.trim();
   const password = form.password;
   const portText = form.port.trim();
+  const requirePassword = options?.requirePassword ?? true;
   const port = Number(portText);
 
   if (!host) {
@@ -966,7 +1034,7 @@ function validateConnectForm(form: ConnectionForm): ConnectFieldErrors {
     errors.username = "用户名不能包含空格。";
   }
 
-  if (!password) {
+  if (requirePassword && !password) {
     errors.password = "密码不能为空。";
   }
 
@@ -1106,6 +1174,10 @@ function BrandLogo({ className = "" }: { className?: string }) {
 function App() {
   const appWindowRef = useRef(getCurrentWindow());
   const [form, setForm] = useState<ConnectionForm>(() => resolveInitialConnectForm());
+  const [themeMode, setThemeMode] = useState<AppThemeMode>(() => readStoredThemeMode());
+  const [systemPrefersDark, setSystemPrefersDark] = useState(() =>
+    typeof window !== "undefined" && window.matchMedia?.("(prefers-color-scheme: dark)").matches ? true : false
+  );
   const [connectionProfiles, setConnectionProfiles] = useState<ConnectionProfile[]>(() => readStoredConnectionProfiles());
   const [activeProfileId, setActiveProfileId] = useState(() => readStoredActiveProfileId());
   const [profileSearchQuery, setProfileSearchQuery] = useState("");
@@ -1117,6 +1189,7 @@ function App() {
   const [currentPath, setCurrentPath] = useState("");
   const [entriesByPath, setEntriesByPath] = useState<EntryMap>({});
   const [expandedPaths, setExpandedPaths] = useState<Record<string, boolean>>({});
+  const [loadingPaths, setLoadingPaths] = useState<Record<string, boolean>>({});
   const [preview, setPreview] = useState<FilePreview | null>(null);
   const [previewError, setPreviewError] = useState("");
   const [previewDisplayMode, setPreviewDisplayMode] = useState<"edit" | "read">("edit");
@@ -1149,11 +1222,11 @@ function App() {
   const [saveFeedback, setSaveFeedback] = useState<SaveFeedbackState | null>(null);
   const [treeContextMenu, setTreeContextMenu] = useState<TreeContextMenuState | null>(null);
   const [fileActionDialog, setFileActionDialog] = useState<FileActionDialogState | null>(null);
+  const [passwordStorageDialog, setPasswordStorageDialog] = useState<PasswordStorageDialogState | null>(null);
   const [commandHistory, setCommandHistory] = useState<CommandHistoryItem[]>(() => readStoredHistory());
   const [historySelection, setHistorySelection] = useState("");
-  const [commandDraft, setCommandDraft] = useState("");
+  const [hasCommandDraft, setHasCommandDraft] = useState(false);
   const [isHistoryMenuOpen, setIsHistoryMenuOpen] = useState(false);
-  const [isSavedProfilesMenuOpen, setIsSavedProfilesMenuOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResultCount, setSearchResultCount] = useState(0);
   const [searchActiveIndex, setSearchActiveIndex] = useState(0);
@@ -1162,10 +1235,11 @@ function App() {
   const terminalRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
   const hasConnectionRef = useRef(false);
+  const searchQueryRef = useRef(searchQuery);
+  const activeWorkspaceRef = useRef(activeWorkspace);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const editorRef = useRef<MonacoEditor.IStandaloneCodeEditor | null>(null);
   const historyMenuRef = useRef<HTMLDivElement | null>(null);
-  const savedProfilesMenuRef = useRef<HTMLDivElement | null>(null);
   const treeContextMenuRef = useRef<HTMLDivElement | null>(null);
   const fileActionInputRef = useRef<HTMLInputElement | null>(null);
   const sidebarResizeStateRef = useRef<{ startX: number; startWidth: number } | null>(null);
@@ -1175,6 +1249,7 @@ function App() {
   const pendingTerminalDraftSyncRef = useRef(false);
   const hasAutoUpdateCheckRef = useRef(false);
   const isNarrowWorkbench = viewportWidth <= NARROW_LAYOUT_BREAKPOINT;
+  const deferredSearchQuery = useDeferredValue(searchQuery);
 
   useEffect(() => {
     void bootstrap();
@@ -1183,6 +1258,42 @@ function App() {
   useEffect(() => {
     hasConnectionRef.current = Boolean(connection);
   }, [connection]);
+
+  useEffect(() => {
+    searchQueryRef.current = searchQuery;
+  }, [searchQuery]);
+
+  useEffect(() => {
+    activeWorkspaceRef.current = activeWorkspace;
+  }, [activeWorkspace]);
+
+  useEffect(() => {
+    const mediaQuery = window.matchMedia?.("(prefers-color-scheme: dark)");
+    if (!mediaQuery) {
+      return;
+    }
+
+    const handleChange = (event: MediaQueryListEvent) => {
+      setSystemPrefersDark(event.matches);
+    };
+
+    setSystemPrefersDark(mediaQuery.matches);
+    mediaQuery.addEventListener("change", handleChange);
+    return () => {
+      mediaQuery.removeEventListener("change", handleChange);
+    };
+  }, []);
+
+  const appliedThemeMode = themeMode === "system" ? (systemPrefersDark ? "dark" : "light") : themeMode;
+
+  useEffect(() => {
+    document.body.dataset.theme = appliedThemeMode;
+    try {
+      window.localStorage.setItem(THEME_STORAGE_KEY, themeMode);
+    } catch (error) {
+      console.error(error);
+    }
+  }, [appliedThemeMode, themeMode]);
 
   useEffect(() => {
     void (async () => {
@@ -1316,16 +1427,11 @@ function App() {
         return;
       }
 
-      if (savedProfilesMenuRef.current && savedProfilesMenuRef.current.contains(event.target as Node)) {
-        return;
-      }
-
       if (treeContextMenuRef.current && treeContextMenuRef.current.contains(event.target as Node)) {
         return;
       }
 
       setIsHistoryMenuOpen(false);
-      setIsSavedProfilesMenuOpen(false);
       setTreeContextMenu(null);
     };
 
@@ -1341,7 +1447,6 @@ function App() {
         setTreeContextMenu(null);
         setFileActionDialog(null);
         setIsAboutDialogOpen(false);
-        setIsSavedProfilesMenuOpen(false);
         if (updateNotice?.kind !== "progress") {
           setUpdateNotice(null);
         }
@@ -1664,7 +1769,7 @@ function App() {
   }, [connection, currentPath]);
 
   useEffect(() => {
-    const query = searchQuery.trim();
+    const query = deferredSearchQuery.trim();
     if (!query) {
       terminalSearchMatchesRef.current = [];
       previewSearchMatchesRef.current = [];
@@ -1701,10 +1806,10 @@ function App() {
     terminalRef.current?.clearSelection();
     setSearchResultCount(0);
     setSearchActiveIndex(0);
-  }, [activeWorkspace, editorContent, preview?.kind, searchQuery, terminalContentVersion]);
+  }, [activeWorkspace, deferredSearchQuery, editorContent, preview?.kind, terminalContentVersion]);
 
   useEffect(() => {
-    const query = searchQuery.trim();
+    const query = deferredSearchQuery.trim();
     if (!query) {
       return;
     }
@@ -1717,7 +1822,7 @@ function App() {
     if (preview?.kind === "Text") {
       focusPreviewSearchMatch(searchActiveIndex);
     }
-  }, [activeWorkspace, preview?.kind, searchActiveIndex, searchQuery]);
+  }, [activeWorkspace, deferredSearchQuery, preview?.kind, searchActiveIndex]);
 
   useEffect(() => {
     if (!terminalHostRef.current) {
@@ -1729,12 +1834,7 @@ function App() {
       fontFamily: '"SF Mono", "JetBrains Mono", Consolas, monospace',
       fontSize: 14,
       lineHeight: 1.1,
-      theme: {
-        background: "rgba(10, 18, 35, 0.02)",
-        foreground: "#f7fbff",
-        cursor: "#ffffff",
-        selectionBackground: "rgba(255,255,255,0.18)"
-      }
+      theme: resolveTerminalTheme(appliedThemeMode)
     });
     const fitAddon = new FitAddon();
 
@@ -1767,10 +1867,14 @@ function App() {
       if (!hasConnectionRef.current) {
         return;
       }
-      trackTerminalInput(data);
-      void invoke("send_terminal_input", { data }).catch((error) => {
-        console.error(error);
-      });
+      const committedCommands = trackTerminalInput(data);
+      void invoke("send_terminal_input", { data })
+        .then(() => {
+          committedCommands.forEach((command) => rememberCommand(command));
+        })
+        .catch((error) => {
+          console.error(error);
+        });
     });
 
     let unlistenChunk: (() => void) | undefined;
@@ -1778,10 +1882,10 @@ function App() {
 
     void listen<TerminalChunk>("terminal-chunk", (event) => {
       terminal.write(event.payload.data);
-      if (pendingTerminalDraftSyncRef.current) {
-        syncDraftFromTerminalBuffer(terminal);
+      syncDraftFromTerminalBuffer(terminal);
+      if (searchQueryRef.current.trim() && activeWorkspaceRef.current === "terminal") {
+        setTerminalContentVersion((previous) => previous + 1);
       }
-      setTerminalContentVersion((previous) => previous + 1);
     }).then((fn) => {
       unlistenChunk = fn;
     });
@@ -1807,7 +1911,15 @@ function App() {
       unlistenStatus?.();
       terminal.dispose();
     };
-  }, []);
+  }, [appliedThemeMode]);
+
+  useEffect(() => {
+    if (!terminalRef.current) {
+      return;
+    }
+
+    terminalRef.current.options.theme = resolveTerminalTheme(appliedThemeMode);
+  }, [appliedThemeMode]);
 
   async function bootstrap() {
     try {
@@ -1823,6 +1935,9 @@ function App() {
       setCurrentPath("/");
       setIsConnectModalOpen(false);
       await loadDirectory("/", { expand: false });
+      window.setTimeout(() => {
+        void restoreTerminalPromptAfterReload();
+      }, 180);
     } else {
       setIsConnectModalOpen(true);
     }
@@ -1848,7 +1963,7 @@ function App() {
     profileIdOverride?: string;
   }) {
     const sourceForm = options?.formOverride ?? form;
-    const errors = validateConnectForm(sourceForm);
+    const errors = validateConnectForm(sourceForm, { requirePassword: false });
     setConnectFieldErrors(errors);
     if (Object.keys(errors).length > 0) {
       if (!options?.silent) {
@@ -1868,14 +1983,65 @@ function App() {
       lastConnectionAt: existingProfile?.lastConnectionAt ?? null
     };
     setConnectionProfiles((previous) => upsertConnectionProfile(previous, profile));
+    persistProfilePassword(profile.id, sourceForm.passwordStorage, sourceForm.password);
     setActiveProfileId(profile.id);
     if (options?.formOverride) {
-      setForm(toFormFromProfile(profile, sourceForm.password));
+      setForm(toFormFromProfile(profile, sourceForm.passwordStorage === "none" ? "" : sourceForm.password));
     }
     if (!options?.silent) {
       setStatusLine(`已保存配置：${profile.name}`);
     }
     return profile.id;
+  }
+
+  function requestSaveCurrentConnectionProfile(options?: {
+    silent?: boolean;
+    formOverride?: ConnectionForm;
+    profileIdOverride?: string;
+  }) {
+    const sourceForm = options?.formOverride ?? form;
+    const errors = validateConnectForm(sourceForm, { requirePassword: false });
+    setConnectFieldErrors(errors);
+    if (Object.keys(errors).length > 0) {
+      if (!options?.silent) {
+        setStatusLine("请先补全后再保存配置。");
+      }
+      return "";
+    }
+
+    if (!options?.silent && sourceForm.password.trim() && sourceForm.passwordStorage === "none") {
+      setPasswordStorageDialog({
+        source: "save-profile",
+        saveOptions: options
+      });
+      return "";
+    }
+
+    return saveCurrentConnectionProfile(options);
+  }
+
+  function applyPasswordStorageMode(mode: PasswordStorageMode) {
+    const nextForm = {
+      ...form,
+      passwordStorage: mode
+    };
+    setForm(nextForm);
+    setStatusLine(
+      mode === "local"
+        ? "密码将跟连接配置一起保存到本地。"
+        : mode === "session"
+          ? "密码仅保留在当前应用会话。"
+          : "密码不会写入任何保存配置。"
+    );
+
+    if (passwordStorageDialog?.source === "save-profile") {
+      saveCurrentConnectionProfile({
+        ...passwordStorageDialog.saveOptions,
+        formOverride: nextForm
+      });
+    }
+
+    setPasswordStorageDialog(null);
   }
 
   function applyConnectionProfile(profile: ConnectionProfile) {
@@ -1891,6 +2057,7 @@ function App() {
     const profile = connectionProfiles.find((item) => item.id === profileId);
     const remaining = connectionProfiles.filter((item) => item.id !== profileId);
     setConnectionProfiles(remaining);
+    clearStoredProfilePassword(profileId);
 
     if (activeProfileId === profileId) {
       setActiveProfileId(remaining[0]?.id ?? "");
@@ -1994,13 +2161,12 @@ function App() {
       setForm(sourceForm);
       clearRemoteBrowserState();
       currentInputBufferRef.current = "";
-      setCommandDraft("");
+      setHasCommandDraft(false);
       setHistorySelection("");
       setCurrentPath("/");
       setStatusLine(`已连接 ${result.host}`);
       setActiveWorkspace("terminal");
       setIsConnectModalOpen(false);
-      setIsSavedProfilesMenuOpen(false);
       setConnectError("");
       setConnectFieldErrors({});
       const savedProfileId = saveCurrentConnectionProfile({
@@ -2074,7 +2240,7 @@ function App() {
     setConnectionProgress(null);
     clearRemoteBrowserState();
     currentInputBufferRef.current = "";
-    setCommandDraft("");
+    setHasCommandDraft(false);
     setHistorySelection("");
     setIsHistoryMenuOpen(false);
     setStatusLine("SSH 会话已关闭");
@@ -2085,6 +2251,10 @@ function App() {
 
   async function loadDirectory(path: string, options?: { expand?: boolean }) {
     setIsListing(true);
+    setLoadingPaths((previous) => ({
+      ...previous,
+      [path]: true
+    }));
     try {
       const data = await invoke<RemoteEntry[]>("read_remote_dir", { path });
       setEntriesByPath((previous) => ({
@@ -2103,6 +2273,15 @@ function App() {
       console.error(error);
       setStatusLine(String(error));
     } finally {
+      setLoadingPaths((previous) => {
+        if (!previous[path]) {
+          return previous;
+        }
+
+        const next = { ...previous };
+        delete next[path];
+        return next;
+      });
       setIsListing(false);
     }
   }
@@ -2134,7 +2313,13 @@ function App() {
         return;
       }
 
-      await loadDirectory(entry.path);
+      setExpandedPaths((previous) => ({
+        ...previous,
+        [entry.path]: true
+      }));
+      setCurrentPath(entry.path);
+      setStatusLine(`正在读取目录: ${entry.path}`);
+      void loadDirectory(entry.path);
       return;
     }
 
@@ -2173,6 +2358,22 @@ function App() {
     }
   }
 
+  async function restoreTerminalPromptAfterReload() {
+    if (!hasConnectionRef.current) {
+      return;
+    }
+
+    try {
+      pendingTerminalDraftSyncRef.current = true;
+      await invoke("send_terminal_input", { data: "\n" });
+      setStatusLine("已恢复 SSH 会话，正在尝试唤起远端命令行提示符...");
+    } catch (error) {
+      console.error(error);
+      setStatusLine("已恢复 SSH 会话，但终端提示符还没出来，可手动按一次回车。");
+      terminalRef.current?.writeln("\r\n[hint] 会话已恢复，如终端没有提示符，请按一次回车。\r\n");
+    }
+  }
+
   function rememberCommand(command: string) {
     const cwd = currentPath || connection?.homePath || "/";
     setCommandHistory((previous) => pushCommandHistory(previous, command, cwd));
@@ -2181,15 +2382,15 @@ function App() {
 
   function syncCommandDraft(next: string) {
     currentInputBufferRef.current = next;
-    setCommandDraft(next);
-    if (next.trim() !== historySelection) {
-      setHistorySelection("");
-    }
+    const nextHasCommandDraft = next.trim().length > 0;
+    setHasCommandDraft((previous) => (previous === nextHasCommandDraft ? previous : nextHasCommandDraft));
+    setHistorySelection((previous) => (next.trim() !== previous ? "" : previous));
   }
 
   function clearRemoteBrowserState() {
     setEntriesByPath({});
     setExpandedPaths({});
+    setLoadingPaths({});
     setPreview(null);
     setPreviewError("");
     setEditorContent("");
@@ -2199,9 +2400,11 @@ function App() {
     setDragTargetPath("");
   }
 
-  function trackTerminalInput(data: string) {
+  function trackTerminalInput(data: string): string[] {
+    const committedCommands: string[] = [];
     if (data.includes("\u001b")) {
-      return;
+      pendingTerminalDraftSyncRef.current = true;
+      return committedCommands;
     }
 
     let next = currentInputBufferRef.current;
@@ -2210,7 +2413,7 @@ function App() {
       if (char === "\r") {
         const committed = next.trim();
         if (committed) {
-          rememberCommand(committed);
+          committedCommands.push(committed);
         }
         next = "";
         continue;
@@ -2236,6 +2439,7 @@ function App() {
     }
 
     syncCommandDraft(next);
+    return committedCommands;
   }
 
   function syncDraftFromTerminalBuffer(terminal: Terminal | null) {
@@ -2299,7 +2503,7 @@ function App() {
 
   function handleEditorMount(editor: MonacoEditor.IStandaloneCodeEditor) {
     editorRef.current = editor;
-    if (searchQuery.trim() && preview?.kind === "Text" && previewSearchMatchesRef.current.length) {
+    if (deferredSearchQuery.trim() && preview?.kind === "Text" && previewSearchMatchesRef.current.length) {
       focusPreviewSearchMatch(searchActiveIndex);
     }
   }
@@ -2414,7 +2618,9 @@ function App() {
     try {
       await invoke("send_terminal_input", { data: "clear\r" });
       setStatusLine("终端已清屏");
-      setTerminalContentVersion((previous) => previous + 1);
+      if (searchQueryRef.current.trim() && activeWorkspaceRef.current === "terminal") {
+        setTerminalContentVersion((previous) => previous + 1);
+      }
       terminalRef.current?.focus();
     } catch (error) {
       console.error(error);
@@ -2667,6 +2873,11 @@ function App() {
     setIsAboutDialogOpen(true);
   }
 
+  function openUpdateEntry() {
+    setIsAboutDialogOpen(true);
+    void checkAppUpdate({ reason: "manual" });
+  }
+
   function closeAboutDialog() {
     setIsAboutDialogOpen(false);
   }
@@ -2812,7 +3023,7 @@ function App() {
         const pastedPaths = results.map((item) => shellEscapePath(item.path)).join(" ");
         if (pastedPaths) {
           await invoke("send_terminal_input", { data: pastedPaths });
-          trackTerminalInput(pastedPaths);
+          trackTerminalInput(pastedPaths).forEach((command) => rememberCommand(command));
           setActiveWorkspace("terminal");
           terminalRef.current?.focus();
           setStatusLine(`已上传剪贴板内容到 ${targetDir}，并填入终端路径`);
@@ -2850,7 +3061,7 @@ function App() {
 
     try {
       await invoke("send_terminal_input", { data: text });
-      trackTerminalInput(text);
+      trackTerminalInput(text).forEach((command) => rememberCommand(command));
       setActiveWorkspace("terminal");
       setStatusLine("已粘贴剪贴板内容到终端");
       terminalRef.current?.focus();
@@ -3205,7 +3416,7 @@ function App() {
     await uploadFiles(files, targetDir, "拖拽");
   }
 
-  function renderTree(path: string, level = 0): JSX.Element[] {
+  function renderTree(path: string, level = 0): RemoteFileTreeNode[] {
     const entries = entriesByPath[path] ?? [];
     return entries.flatMap((entry) => {
       const expanded = Boolean(expandedPaths[entry.path]);
@@ -3217,41 +3428,34 @@ function App() {
       const children = entry.isDir && expanded ? renderTree(entry.path, level + 1) : [];
 
       return [
-        <button
-          className={`tree-row ${currentPath === entry.path ? "active" : ""} ${dragTargetPath === dropTargetDir ? "drag-over" : ""} access-${accessState}`}
-          key={entry.path}
-          onClick={() => void openEntry(entry)}
-          onContextMenu={(event) =>
-            openTreeContextMenu(
-              event,
-              entry,
-              dropTargetDir,
-              entry.isDir ? entry.path : entry.name
-            )
-          }
-          onDragOver={(event) => handleTreeDragOver(event, dropTargetDir)}
-          onDragLeave={(event) => handleTreeDragLeave(event, dropTargetDir)}
-          onDrop={(event) => void handleTreeDrop(event, entry)}
-          style={{ paddingLeft: `${16 + level * 18}px` }}
-          title={`${entry.isDir ? `拖文件到这里，上传到 ${entry.path}` : `拖文件到这里，上传到 ${dropTargetDir}`} · ${accessLabel} · ${accessHint} · 权限 ${formatPermissions(entry.permissions)}`}
-        >
-          <span className="tree-toggle">{entry.isDir ? (expanded ? "▾" : "▸") : ""}</span>
-          <span className={`file-icon ${entry.isDir ? "dir" : "file"} ${accessState}`} aria-hidden="true" />
-          <span className="tree-main">
-            <span className="tree-main-head">
-              <span className="tree-name">{entry.name}</span>
-              <span className={`entry-access-badge ${accessState}`}>{accessBadge}</span>
-            </span>
-            <span className="tree-submeta">
-              {entry.isDir ? "目录" : "文件"} · {accessLabel} · {formatModifiedAt(entry.modifiedAt)}
-            </span>
-          </span>
-          <span className="file-meta">{entry.isDir ? formatPermissions(entry.permissions) : `${formatBytes(entry.size)} · ${formatPermissions(entry.permissions)}`}</span>
-        </button>,
+        {
+          key: entry.path,
+          entry,
+          level,
+          accessState,
+          accessLabel,
+          accessBadge,
+          accessHint,
+          dropTargetDir,
+          targetLabel: entry.isDir ? entry.path : entry.name,
+          isActive: currentPath === entry.path,
+          isExpanded: expanded,
+          isDropTarget: dragTargetPath === dropTargetDir,
+          isLoading: Boolean(entry.isDir && loadingPaths[entry.path]),
+          modifiedAtLabel: formatModifiedAt(entry.modifiedAt),
+          sizeLabel: formatBytes(entry.size),
+          permissionsLabel: formatPermissions(entry.permissions),
+          title: `${entry.isDir ? `拖文件到这里，上传到 ${entry.path}` : `拖文件到这里，上传到 ${dropTargetDir}`} · ${accessLabel} · ${accessHint} · 权限 ${formatPermissions(entry.permissions)}`
+        },
         ...children
       ];
     });
   }
+
+  const treeNodes = useMemo(
+    () => renderTree("/"),
+    [entriesByPath, expandedPaths, currentPath, dragTargetPath, loadingPaths, connection?.id, connection?.homePath]
+  );
 
   const connectionHostText = connection?.host ?? "未连接";
   const currentWorkspaceTitle =
@@ -3267,10 +3471,8 @@ function App() {
         ? `${preview.kind} · ${formatBytes(preview.size)}${preview.truncated ? ` · 已截断到 ${formatBytes(preview.previewBytes)}` : ""}`
         : previewError || "点文件树里的文件就会在这里预览";
   const selectionPath = selectedEntry?.path ?? preview?.path ?? currentPath ?? "/";
-  const basicStatusLabel = connection ? "已连接" : "未连接";
   const basicLatencyLabel = connection ? `${connection.latencyMs}ms` : "--";
   const terminalStatusLabel = connection ? "终端在线" : "终端离线";
-  const versionLabel = appVersion ? `v${appVersion}` : "版本读取中";
   const updateButtonLabel = updateInfo?.available && updateInfo.version ? `有新版本 ${updateInfo.version}` : "关于 / 更新";
   const updateButtonTitle = updateInfo?.available
     ? [updateInfo.message, updateInfo.notes].filter(Boolean).join("\n\n")
@@ -3351,24 +3553,57 @@ function App() {
       ? `应用当前是 v${appVersion}，但更新源 latest.json 还停在 v${updateFeedInfo.version}。这通常不是客户端检查坏了，而是 GitHub Release 流水线还没把最新版本产物和清单切过去。`
       : "";
   const updateNoticeClass = updateNotice ? `update-notice ${updateNotice.tone}` : "update-notice";
-  const currentEntries = currentPath ? entriesByPath[currentPath] ?? [] : entriesByPath["/"] ?? [];
-  const currentDirCount = currentEntries.filter((entry) => entry.isDir).length;
-  const currentFileCount = currentEntries.filter((entry) => !entry.isDir).length;
-  const activeConnectionProfile = connectionProfiles.find((item) => item.id === activeProfileId) ?? null;
-  const matchedConnectionProfile =
-    connectionProfiles.find((item) => profileMatchesForm(item, form)) ?? null;
-  const normalizedProfileSearchQuery = profileSearchQuery.trim().toLocaleLowerCase();
-  const visibleConnectionProfiles = connectionProfiles.filter((profile) => {
-    if (!normalizedProfileSearchQuery) {
-      return true;
-    }
+  const currentEntries = useMemo(
+    () => (currentPath ? entriesByPath[currentPath] ?? [] : entriesByPath["/"] ?? []),
+    [currentPath, entriesByPath]
+  );
+  const { currentDirCount, currentFileCount } = useMemo(() => {
+    let dirCount = 0;
+    let fileCount = 0;
 
-    const haystack = [profile.name, profile.host, profile.port, profile.username].join(" ").toLocaleLowerCase();
-    return haystack.includes(normalizedProfileSearchQuery);
-  });
-  const recentConnectionProfiles = connectionProfiles.filter((item) => item.lastUsedAt).slice(0, 4);
-  const failedConnectionProfiles = connectionProfiles.filter((item) => item.lastConnectionOutcome === "error").length;
-  const pinnedConnectionProfiles = connectionProfiles.filter((item) => item.pinned).length;
+    currentEntries.forEach((entry) => {
+      if (entry.isDir) {
+        dirCount += 1;
+        return;
+      }
+
+      fileCount += 1;
+    });
+
+    return { currentDirCount: dirCount, currentFileCount: fileCount };
+  }, [currentEntries]);
+  const activeConnectionProfile = useMemo(
+    () => connectionProfiles.find((item) => item.id === activeProfileId) ?? null,
+    [activeProfileId, connectionProfiles]
+  );
+  const matchedConnectionProfile = useMemo(
+    () => connectionProfiles.find((item) => profileMatchesForm(item, form)) ?? null,
+    [connectionProfiles, form]
+  );
+  const normalizedProfileSearchQuery = profileSearchQuery.trim().toLocaleLowerCase();
+  const { visibleConnectionProfiles, recentConnectionProfiles, failedConnectionProfiles, pinnedConnectionProfiles } = useMemo(() => {
+    const visible = connectionProfiles.filter((profile) => {
+      if (!normalizedProfileSearchQuery) {
+        return true;
+      }
+
+      const haystack = [profile.name, profile.host, profile.port, profile.username].join(" ").toLocaleLowerCase();
+      return haystack.includes(normalizedProfileSearchQuery);
+    });
+
+    return {
+      visibleConnectionProfiles: visible,
+      recentConnectionProfiles: connectionProfiles.filter((item) => item.lastUsedAt).slice(0, 4),
+      failedConnectionProfiles: connectionProfiles.filter((item) => item.lastConnectionOutcome === "error").length,
+      pinnedConnectionProfiles: connectionProfiles.filter((item) => item.pinned).length
+    };
+  }, [connectionProfiles, normalizedProfileSearchQuery]);
+  const passwordStorageLabel =
+    form.passwordStorage === "local"
+      ? "保存到本地"
+      : form.passwordStorage === "session"
+        ? "仅当前会话"
+        : "不保存密码";
   const connectedProfileId = connection ? activeProfileId : "";
   const connectionStageLabel = formatConnectionStage(connectionProgress?.stage);
   const connectionProgressPercent = connectionProgress
@@ -3383,19 +3618,24 @@ function App() {
   const connectionConfigLabel = connectionProfiles.length
     ? `连接配置 · ${connectionProfiles.length}`
     : connectionActionLabel;
-  const savedProfilesLabel = connectionProfiles.length
-    ? `已保存连接 · ${connectionProfiles.length}`
-    : "已保存连接";
   const connectionUserLabel = connection?.name.includes("@")
     ? connection.name.split("@")[0]
     : form.username.trim() || "--";
+  const themeLabel =
+    themeMode === "system" ? "主题 · 跟随系统" : themeMode === "light" ? "主题 · 浅色" : themeMode === "dark" ? "主题 · 深色" : "主题 · 默认";
   const sidebarPathLabel = currentPath || connection?.homePath || "/";
   const sidebarSummaryLabel = connection ? `${currentDirCount} 个目录 · ${currentFileCount} 个文件` : "未连接";
   const previewEditorLanguage = resolveEditorLanguage(preview?.language);
   const searchCounterLabel = searchResultCount ? `${searchActiveIndex + 1} / ${searchResultCount}` : "0 / 0";
   const currentDirectoryPath = currentPath || connection?.homePath || "/";
-  const scopedCommandHistory = commandHistory.filter((item) => item.cwd === currentDirectoryPath);
-  const favoriteCommandHistory = commandHistory.filter((item) => item.favorite);
+  const scopedCommandHistory = useMemo(
+    () => commandHistory.filter((item) => item.cwd === currentDirectoryPath),
+    [commandHistory, currentDirectoryPath]
+  );
+  const favoriteCommandHistory = useMemo(
+    () => commandHistory.filter((item) => item.favorite),
+    [commandHistory]
+  );
   const connectIssue = connectError ? summarizeConnectError(connectError, form) : null;
   const previewAccessNotice =
     preview && selectedEntry && preview.path === selectedEntry.path && !selectedEntry.canWrite
@@ -3405,13 +3645,21 @@ function App() {
           message: "这个 SSH 账号可以查看内容，但没有写入权限，保存和粘贴修改都已禁用。"
         }
       : null;
-  const historyTriggerSummary = commandHistory.length
-    ? favoriteCommandHistory.length
-      ? `最近命令 ${favoriteCommandHistory.length}★ / ${commandHistory.length}`
-      : scopedCommandHistory.length
-        ? `最近命令 ${scopedCommandHistory.length}/${commandHistory.length}`
-      : `最近命令 (${commandHistory.length})`
-    : "最近命令";
+  const historyTriggerSummary = useMemo(() => {
+    if (!commandHistory.length) {
+      return "最近命令";
+    }
+
+    if (favoriteCommandHistory.length) {
+      return `最近命令 ${favoriteCommandHistory.length}★ / ${commandHistory.length}`;
+    }
+
+    if (scopedCommandHistory.length) {
+      return `最近命令 ${scopedCommandHistory.length}/${commandHistory.length}`;
+    }
+
+    return `最近命令 (${commandHistory.length})`;
+  }, [commandHistory.length, favoriteCommandHistory.length, scopedCommandHistory.length]);
   const workbenchStyle = isNarrowWorkbench
     ? undefined
     : {
@@ -3546,18 +3794,12 @@ function App() {
       ) : null}
 
       <TopToolbar
-        savedProfilesMenuRef={savedProfilesMenuRef}
         connection={connection}
-        connectionHostText={connectionHostText}
-        basicStatusLabel={basicStatusLabel}
-        basicLatencyLabel={basicLatencyLabel}
-        versionLabel={versionLabel}
-        statusLine={statusLine}
-        savedProfilesLabel={savedProfilesLabel}
-        connectionConfigLabel={connectionConfigLabel}
-        currentPath={currentPath}
-        isConnecting={isConnecting}
-        isListing={isListing}
+        connectionUserLabel={connectionUserLabel}
+        connectionAddressLabel={connection?.host ?? (form.host.trim() || "--")}
+        appVersionLabel={appVersion ? `v${appVersion}` : "版本读取中"}
+        themeLabel={themeLabel}
+        themeMode={themeMode}
         isWindowFullscreen={isWindowFullscreen}
         isWindowMaximized={isWindowMaximized}
         updateInfo={updateInfo}
@@ -3567,12 +3809,6 @@ function App() {
         checkUpdateButtonLabel={checkUpdateButtonLabel}
         isCheckingUpdate={isCheckingUpdate}
         isInstallingUpdate={isInstallingUpdate}
-        activeProfileId={activeProfileId}
-        connectedProfileId={connectedProfileId}
-        connectionProfiles={connectionProfiles}
-        recentConnectionProfiles={recentConnectionProfiles}
-        failedConnectionProfiles={failedConnectionProfiles}
-        isSavedProfilesMenuOpen={isSavedProfilesMenuOpen}
         onWindowMouseDown={(event) => {
           void startWindowDragging(event);
         }}
@@ -3582,26 +3818,10 @@ function App() {
           }
           void toggleWindowMaximize();
         }}
-        onToggleSavedProfilesMenu={() => setIsSavedProfilesMenuOpen((previous) => !previous)}
-        onSaveCurrentProfile={() => {
-          saveCurrentConnectionProfile();
+        onCopyAddress={() => {
+          void copyTextToClipboard(connection?.host ?? form.host.trim(), "主机地址");
         }}
-        onOpenConnectModal={() => setIsConnectModalOpen(true)}
-        onConnectWithProfile={(profile) => {
-          void connectWithProfile(profile);
-        }}
-        onDisconnect={() => {
-          void disconnect();
-        }}
-        onUploadClipboardFiles={() => {
-          void uploadWindowsClipboardFiles(currentPath || connection?.homePath || "/");
-        }}
-        onGoParent={() => {
-          void goParent();
-        }}
-        onRefreshDirectory={() => {
-          void loadDirectory(currentPath);
-        }}
+        onSelectTheme={setThemeMode}
         onOpenAbout={openAboutDialog}
         onCheckUpdate={() => {
           void checkAppUpdate({ reason: "manual" });
@@ -3621,49 +3841,81 @@ function App() {
         onCloseWindow={() => {
           void closeWindow();
         }}
-        formatTime={formatUpdateCheckTime}
       />
 
       <div className="workbench" style={workbenchStyle}>
         <aside className="navigator-panel glass-panel">
           <section className="navigator-toolbar">
-            <div className="navigator-toolbar-main">
+            <div className="server-overview-head">
               <BrandLogo className="mini-sidebar-logo" />
-              <div className="navigator-toolbar-meta">
-                <strong>{sidebarPathLabel}</strong>
+              <div className="server-overview-copy">
+                <strong>{connection?.name ?? "当前主机"}</strong>
                 <span>{connection ? `${connectionUserLabel} @ ${connectionHostText}` : "未连接"}</span>
+                <small>{sidebarPathLabel}</small>
               </div>
               <span className={`status-pill ${connection ? "live" : connectionProgress?.isError ? "" : "progress-pill"}`}>
                 {connectionStageLabel}
               </span>
             </div>
 
-            <div className={`connect-progress-card compact ${connectionProgress?.isError ? "error" : connection ? "connected" : ""}`}>
-              <div className="connect-progress-head">
-                <strong>{connectionProgress?.message ?? sidebarSummaryLabel}</strong>
-                <span>{connectionProgress ? `${Math.round(connectionProgressPercent)}%` : connection ? "100%" : "--"}</span>
+            {(!connection || connectionProgress?.isError) && connectionProgress ? (
+              <div className={`server-overview-note ${connectionProgress.isError ? "error" : ""}`}>
+                <strong>{connectionProgress.message}</strong>
+                <span>{connectionProgressDetail}</span>
               </div>
-              <div className="update-progress-track connect-progress-track">
-                <div className="update-progress-fill" style={{ width: `${connection ? 100 : connectionProgressPercent}%` }} />
-              </div>
-              <p>{connectionProgressDetail}</p>
-            </div>
+            ) : null}
 
-            <div className="navigator-toolbar-actions">
-              <button className="primary-button small-primary" disabled={isConnecting} onClick={() => setIsConnectModalOpen(true)}>
-                {isConnecting ? "连接中..." : connectionConfigLabel}
-              </button>
-              <button className="ghost-button small" disabled={!connection || isConnecting} onClick={() => void disconnect()}>
-                断开
-              </button>
-              <button
-                className="ghost-button small"
-                disabled={!connection || !currentPath || isListing}
-                onClick={() => void loadDirectory(currentPath || "/")}
+            {connection ? (
+              <HostRuntimeSection
+                connection={connection}
+                connectionHostText={connectionHostText}
+                basicLatencyLabel={basicLatencyLabel}
+                pollIntervalMs={SYSTEM_SNAPSHOT_POLL_INTERVAL_MS}
               >
-                {isListing ? "刷新中..." : "刷新"}
-              </button>
-            </div>
+                {({ detailButton, metricsPanel }) => (
+                  <>
+                    <div className="navigator-toolbar-actions">
+                      <button className="primary-button small-primary" disabled={isConnecting} onClick={() => setIsConnectModalOpen(true)}>
+                        {isConnecting ? "连接中..." : connectionConfigLabel}
+                      </button>
+                      <button className="ghost-button small" disabled={!connection || isConnecting} onClick={() => void disconnect()}>
+                        断开
+                      </button>
+                      {detailButton}
+                      <button
+                        className="ghost-button small"
+                        disabled={!connection || !currentPath || isListing}
+                        onClick={() => void loadDirectory(currentPath || "/")}
+                      >
+                        {isListing ? "刷新中..." : "刷新"}
+                      </button>
+                    </div>
+                    {metricsPanel}
+                  </>
+                )}
+              </HostRuntimeSection>
+            ) : (
+              <>
+                <div className="navigator-toolbar-actions">
+                  <button className="primary-button small-primary" disabled={isConnecting} onClick={() => setIsConnectModalOpen(true)}>
+                    {isConnecting ? "连接中..." : connectionConfigLabel}
+                  </button>
+                  <button className="ghost-button small" disabled>
+                    断开
+                  </button>
+                  <button className="ghost-button small" disabled>
+                    主机详情
+                  </button>
+                  <button className="ghost-button small" disabled>
+                    刷新
+                  </button>
+                </div>
+                <div className="server-overview-empty">
+                  <strong>资源概览待连接</strong>
+                  <span>连接成功后这里会显示 CPU、内存、硬盘和网络信息。</span>
+                </div>
+              </>
+            )}
           </section>
 
           <RemoteFileTree
@@ -3679,7 +3931,7 @@ function App() {
                 <span className="tree-legend-item blocked">受限</span>
               </>
             }
-            treeNodes={renderTree("/")}
+            treeNodes={treeNodes}
             onRootDragOver={(event) => handleTreeDragOver(event, currentPath || connection?.homePath || "/")}
             onRootDragLeave={(event) => handleTreeDragLeave(event, currentPath || connection?.homePath || "/")}
             onRootDrop={(event) => {
@@ -3693,6 +3945,17 @@ function App() {
                 currentPath || connection?.homePath || "/"
               )
             }
+            onOpenEntry={(entry) => {
+              void openEntry(entry);
+            }}
+            onOpenContextMenu={(event, entry, targetDir, targetLabel) => {
+              openTreeContextMenu(event, entry, targetDir, targetLabel);
+            }}
+            onRowDragOver={(event, targetDir) => handleTreeDragOver(event, targetDir)}
+            onRowDragLeave={(event, targetDir) => handleTreeDragLeave(event, targetDir)}
+            onRowDrop={(event, entry) => {
+              void handleTreeDrop(event, entry);
+            }}
           />
 
         </aside>
@@ -3782,6 +4045,7 @@ function App() {
                   previewError={previewError}
                   editorContent={editorContent}
                   editorLanguage={previewEditorLanguage}
+                  editorThemeMode={appliedThemeMode}
                   previewDisplayMode={previewDisplayMode}
                   isActive={activeWorkspace === "preview"}
                   accessNotice={previewAccessNotice}
@@ -3807,7 +4071,7 @@ function App() {
                 historySelection={historySelection}
                 historyTriggerSummary={historyTriggerSummary}
                 currentDirectoryPath={currentDirectoryPath}
-                commandDraft={commandDraft}
+                hasCommandDraft={hasCommandDraft}
                 searchQuery={searchQuery}
                 searchResultCount={searchResultCount}
                 searchCounterLabel={searchCounterLabel}
@@ -4010,7 +4274,9 @@ function App() {
         connectedProfileId={connectedProfileId}
         profileSearchQuery={profileSearchQuery}
         isConnecting={isConnecting}
+        isCheckingUpdate={isCheckingUpdate}
         hasConnection={Boolean(connection)}
+        passwordStorageLabel={passwordStorageLabel}
         onClose={() => setIsConnectModalOpen(false)}
         onConnect={() => {
           void connect();
@@ -4025,8 +4291,12 @@ function App() {
         onDisconnect={() => {
           void disconnect();
         }}
+        onOpenUpdateEntry={openUpdateEntry}
+        onOpenPasswordStorageDialog={() => {
+          setPasswordStorageDialog({ source: "settings" });
+        }}
         onSaveCurrentProfile={() => {
-          saveCurrentConnectionProfile();
+          requestSaveCurrentConnectionProfile();
         }}
         onProfileSearchChange={setProfileSearchQuery}
         onApplyProfile={applyConnectionProfile}
@@ -4034,6 +4304,13 @@ function App() {
         onDeleteProfile={removeConnectionProfile}
         onFieldChange={updateConnectField}
         formatTime={formatUpdateCheckTime}
+      />
+
+      <PasswordStorageDialog
+        isOpen={Boolean(passwordStorageDialog)}
+        mode={form.passwordStorage}
+        onConfirm={applyPasswordStorageMode}
+        onClose={() => setPasswordStorageDialog(null)}
       />
     </div>
   );

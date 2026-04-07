@@ -50,6 +50,37 @@ pub struct ShellOverview {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RemoteProcessStat {
+    pub command: String,
+    pub cpu_percent: f64,
+    pub memory_percent: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteSystemSnapshot {
+    pub cpu_percent: f64,
+    pub cpu_core_count: u32,
+    pub cpu_model: String,
+    pub load_average: Vec<f64>,
+    pub uptime_seconds: u64,
+    pub memory_total_bytes: u64,
+    pub memory_available_bytes: u64,
+    pub memory_used_bytes: u64,
+    pub memory_usage_percent: f64,
+    pub root_total_bytes: u64,
+    pub root_available_bytes: u64,
+    pub root_used_bytes: u64,
+    pub root_usage_percent: f64,
+    pub root_mount_path: String,
+    pub root_file_system_type: String,
+    pub network_rx_bytes_per_sec: f64,
+    pub network_tx_bytes_per_sec: f64,
+    pub top_processes: Vec<RemoteProcessStat>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct FilePreview {
     pub path: String,
     pub kind: String,

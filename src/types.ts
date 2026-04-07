@@ -49,6 +49,33 @@ export interface ShellOverview {
   recentFiles: string[];
 }
 
+export interface RemoteSystemSnapshot {
+  cpuPercent: number;
+  cpuCoreCount: number;
+  cpuModel: string;
+  loadAverage: number[];
+  uptimeSeconds: number;
+  memoryTotalBytes: number;
+  memoryAvailableBytes: number;
+  memoryUsedBytes: number;
+  memoryUsagePercent: number;
+  rootTotalBytes: number;
+  rootAvailableBytes: number;
+  rootUsedBytes: number;
+  rootUsagePercent: number;
+  rootMountPath: string;
+  rootFileSystemType: string;
+  networkRxBytesPerSec: number;
+  networkTxBytesPerSec: number;
+  topProcesses: RemoteProcessStat[];
+}
+
+export interface RemoteProcessStat {
+  command: string;
+  cpuPercent: number;
+  memoryPercent: number;
+}
+
 export interface SaveResponse {
   path: string;
   bytesWritten: number;

@@ -1,9 +1,12 @@
+export type PasswordStorageMode = "none" | "session" | "local";
+
 export type ConnectionForm = {
   name: string;
   host: string;
   port: string;
   username: string;
   password: string;
+  passwordStorage: PasswordStorageMode;
 };
 
 export type ConnectionProfile = {
@@ -17,28 +20,106 @@ export type ConnectionProfile = {
   lastConnectionOutcome: "success" | "error" | null;
   lastConnectionMessage: string | null;
   lastConnectionAt: string | null;
+  passwordStorage: PasswordStorageMode;
+  password: string;
   updatedAt: string;
 };
 
 const CONNECTION_DRAFT_STORAGE_KEY = "fshell-connection-draft";
 const CONNECTION_PROFILES_STORAGE_KEY = "fshell-connection-profiles";
 const ACTIVE_CONNECTION_PROFILE_STORAGE_KEY = "fshell-active-connection-profile";
+const CONNECTION_SESSION_PASSWORD_STORAGE_KEY = "fshell-connection-session-passwords";
 
 export const initialConnectionForm: ConnectionForm = {
   name: "我的服务器",
   host: "127.0.0.1",
   port: "22",
   username: "root",
-  password: ""
+  password: "",
+  passwordStorage: "none"
 };
 
-export function toFormFromProfile(profile: ConnectionProfile, password = ""): ConnectionForm {
+function normalizePasswordStorageMode(value: unknown): PasswordStorageMode {
+  return value === "session" || value === "local" ? value : "none";
+}
+
+function readStoredSessionPasswords(): Record<string, string> {
+  try {
+    const raw = window.sessionStorage.getItem(CONNECTION_SESSION_PASSWORD_STORAGE_KEY);
+    if (!raw) {
+      return {};
+    }
+
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") {
+      return {};
+    }
+
+    return Object.fromEntries(
+      Object.entries(parsed).filter((entry): entry is [string, string] => typeof entry[0] === "string" && typeof entry[1] === "string")
+    );
+  } catch (error) {
+    console.error(error);
+    return {};
+  }
+}
+
+function persistSessionPasswords(passwords: Record<string, string>) {
+  try {
+    if (Object.keys(passwords).length) {
+      window.sessionStorage.setItem(CONNECTION_SESSION_PASSWORD_STORAGE_KEY, JSON.stringify(passwords));
+    } else {
+      window.sessionStorage.removeItem(CONNECTION_SESSION_PASSWORD_STORAGE_KEY);
+    }
+  } catch (error) {
+    console.error(error);
+  }
+}
+
+export function resolveStoredProfilePassword(profile: ConnectionProfile): string {
+  if (profile.passwordStorage === "local") {
+    return profile.password;
+  }
+
+  if (profile.passwordStorage === "session") {
+    return readStoredSessionPasswords()[profile.id] ?? "";
+  }
+
+  return "";
+}
+
+export function persistProfilePassword(profileId: string, mode: PasswordStorageMode, password: string) {
+  if (!profileId) {
+    return;
+  }
+
+  const passwords = readStoredSessionPasswords();
+  if (mode === "session" && password) {
+    passwords[profileId] = password;
+  } else {
+    delete passwords[profileId];
+  }
+  persistSessionPasswords(passwords);
+}
+
+export function clearStoredProfilePassword(profileId: string) {
+  if (!profileId) {
+    return;
+  }
+
+  const passwords = readStoredSessionPasswords();
+  delete passwords[profileId];
+  persistSessionPasswords(passwords);
+}
+
+export function toFormFromProfile(profile: ConnectionProfile, password = resolveStoredProfilePassword(profile)): ConnectionForm {
   return {
     name: profile.name,
     host: profile.host,
     port: profile.port,
     username: profile.username,
-    password
+    password,
+    passwordStorage: profile.passwordStorage
   };
 }
 
@@ -73,6 +154,8 @@ function sanitizeConnectionProfile(value: unknown): ConnectionProfile | null {
         : null,
     lastConnectionMessage: typeof candidate.lastConnectionMessage === "string" ? candidate.lastConnectionMessage : null,
     lastConnectionAt: typeof candidate.lastConnectionAt === "string" ? candidate.lastConnectionAt : null,
+    passwordStorage: normalizePasswordStorageMode(candidate.passwordStorage),
+    password: typeof candidate.password === "string" ? candidate.password : "",
     updatedAt: candidate.updatedAt
   };
 }
@@ -88,7 +171,8 @@ function sanitizeConnectionDraft(value: unknown): ConnectionForm {
     host: typeof candidate.host === "string" ? candidate.host : initialConnectionForm.host,
     port: typeof candidate.port === "string" ? candidate.port : initialConnectionForm.port,
     username: typeof candidate.username === "string" ? candidate.username : initialConnectionForm.username,
-    password: ""
+    password: "",
+    passwordStorage: normalizePasswordStorageMode(candidate.passwordStorage)
   };
 }
 
@@ -175,6 +259,8 @@ export function buildConnectionProfile(form: ConnectionForm, profileId?: string)
     lastConnectionOutcome: null,
     lastConnectionMessage: null,
     lastConnectionAt: null,
+    passwordStorage: form.passwordStorage,
+    password: form.passwordStorage === "local" ? form.password : "",
     updatedAt: now
   };
 }

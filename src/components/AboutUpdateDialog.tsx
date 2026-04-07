@@ -82,6 +82,17 @@ export default function AboutUpdateDialog({
     return null;
   }
 
+  const hasAdvancedInfo = Boolean(
+    releaseNotesList.length ||
+      updateFeedLagNotice ||
+      releasePageUrl ||
+      latestJsonUrl ||
+      updateFeedInfo?.version ||
+      dismissedUpdateVersion ||
+      publishedAtLabel ||
+      updateLatencyLabel
+  );
+
   return (
     <div className="modal-backdrop" onClick={onClose}>
       <section className="glass-panel connect-dialog about-dialog" onClick={(event) => event.stopPropagation()}>
@@ -91,6 +102,18 @@ export default function AboutUpdateDialog({
             <h2>关于 / 更新</h2>
           </div>
           <span className={`status-pill ${updateInfo?.available ? "about-pill-highlight" : "live"}`}>{updateStatusLabel}</span>
+        </div>
+
+        <div className="action-row about-hero-actions">
+          <button className="primary-button" disabled={isCheckingUpdate || isInstallingUpdate} onClick={updateInfo?.available ? onInstallUpdate : onCheckUpdate}>
+            {aboutPrimaryLabel}
+          </button>
+          <button className="ghost-button" onClick={onCopyVersion}>
+            复制版本号
+          </button>
+          <button className="ghost-button" onClick={onClose}>
+            关闭
+          </button>
         </div>
 
         {updateInfo?.available ? (
@@ -124,44 +147,14 @@ export default function AboutUpdateDialog({
             <small>{updateInfo?.available ? "GitHub Releases 已发现更新" : "已同步到最新发布状态"}</small>
           </div>
           <div className="about-card">
-            <span>发布时间</span>
-            <strong>{publishedAtLabel}</strong>
-            <small>来自 updater 返回的发布时间</small>
-          </div>
-          <div className="about-card">
-            <span>清单版本</span>
-            <strong>{updateFeedInfo?.version ?? "--"}</strong>
-            <small>{updateFeedInfo?.message ?? "还没读取 latest.json 诊断信息。"}</small>
-          </div>
-          <div className="about-card">
-            <span>更新源</span>
-            <strong>GitHub Releases</strong>
-            <small>latest.json + installer signatures</small>
-          </div>
-          <div className="about-card">
-            <span>清单时间</span>
-            <strong>{updateFeedPublishedAtLabel}</strong>
-            <small>{updateFeedInfo?.downloadUrl ? "latest.json 里已经带了可下载安装包地址。" : "还没从更新源里拿到安装包地址。"}</small>
-          </div>
-          <div className="about-card">
-            <span>检查耗时</span>
-            <strong>{updateLatencyLabel}</strong>
-            <small>GitHub 访问、代理状态和签名校验都会拖慢这里。</small>
-          </div>
-          <div className="about-card">
-            <span>当前阶段</span>
-            <strong>{updateProgressStatusLabel}</strong>
-            <small>{isInstallingUpdate ? "安装进行中，请勿重复点击。" : "启动后会自动后台检查一次。"}</small>
-          </div>
-          <div className="about-card">
             <span>上次检查</span>
             <strong>{lastCheckedAtLabel}</strong>
             <small>{updateCheckOutcomeLabel}</small>
           </div>
           <div className="about-card">
-            <span>忽略版本</span>
-            <strong>{dismissedUpdateVersion || "--"}</strong>
-            <small>{dismissedUpdateVersion ? "这个版本在启动时不会重复弹提醒。" : "当前没有被忽略的版本。"}</small>
+            <span>当前阶段</span>
+            <strong>{updateProgressStatusLabel}</strong>
+            <small>{isInstallingUpdate ? "安装进行中，请勿重复点击。" : "点上面的按钮即可手动检查或安装。"}</small>
           </div>
         </div>
 
@@ -196,6 +189,29 @@ export default function AboutUpdateDialog({
               </div>
             </div>
           ) : null}
+        </div>
+
+        <div className="about-grid about-grid-compact">
+          <div className="about-card">
+            <span>发布时间</span>
+            <strong>{publishedAtLabel}</strong>
+            <small>发布页记录的版本发布时间</small>
+          </div>
+          <div className="about-card">
+            <span>检查耗时</span>
+            <strong>{updateLatencyLabel}</strong>
+            <small>网络或代理慢时这里会明显变长</small>
+          </div>
+          <div className="about-card">
+            <span>更新源</span>
+            <strong>{updateFeedInfo?.version ? `latest.json · v${updateFeedInfo.version}` : "GitHub Releases"}</strong>
+            <small>{updateFeedPublishedAtLabel}</small>
+          </div>
+          <div className="about-card">
+            <span>忽略版本</span>
+            <strong>{dismissedUpdateVersion || "--"}</strong>
+            <small>{dismissedUpdateVersion ? "这个版本启动时不会重复提醒" : "当前没有忽略版本"}</small>
+          </div>
         </div>
 
         <div className="about-settings-block">
@@ -246,58 +262,60 @@ export default function AboutUpdateDialog({
           </div>
         </div>
 
-        <div className="list-block about-link-list">
-          <div className="about-link-row">
-            <span>Release 页面</span>
-            <div className="about-link-actions">
-              <div className="path-chip subtle">{releasePageUrl}</div>
-              <button className="ghost-button small" onClick={onCopyReleasePage}>
-                复制
-              </button>
-            </div>
-          </div>
-          <div className="about-link-row">
-            <span>latest.json</span>
-            <div className="about-link-actions">
-              <div className="path-chip subtle">{latestJsonUrl}</div>
-              <button className="ghost-button small" onClick={onCopyLatestJson}>
-                复制
-              </button>
-            </div>
-          </div>
-        </div>
+        {hasAdvancedInfo ? (
+          <details className="about-advanced">
+            <summary className="about-advanced-summary">
+              <div>
+                <strong>高级信息</strong>
+                <span>诊断链接、清单状态和更新说明都收在这里，默认不打扰主操作。</span>
+              </div>
+              <span className="about-advanced-toggle">展开 / 收起</span>
+            </summary>
 
-        <div className="about-notes-block">
-          <div className="section-title compact-title">
-            <div>
-              <p className="eyebrow">更新说明</p>
-              <h3>{updateInfo?.version ? `v${updateInfo.version}` : "尚未获取更新说明"}</h3>
-            </div>
-          </div>
-          <div className="about-notes">
-            {releaseNotesList.length > 0 ? (
-              <ul className="about-notes-list">
-                {releaseNotesList.map((note, index) => (
-                  <li key={`${note}-${index}`}>{note}</li>
-                ))}
-              </ul>
-            ) : (
-              <p>当前没有额外的更新说明。你也可以直接去 GitHub Release 页面查看完整产物和标签。</p>
-            )}
-          </div>
-        </div>
+            <div className="about-advanced-body">
+              <div className="list-block about-link-list">
+                <div className="about-link-row">
+                  <span>Release 页面</span>
+                  <div className="about-link-actions">
+                    <div className="path-chip subtle">{releasePageUrl}</div>
+                    <button className="ghost-button small" onClick={onCopyReleasePage}>
+                      复制
+                    </button>
+                  </div>
+                </div>
+                <div className="about-link-row">
+                  <span>latest.json</span>
+                  <div className="about-link-actions">
+                    <div className="path-chip subtle">{latestJsonUrl}</div>
+                    <button className="ghost-button small" onClick={onCopyLatestJson}>
+                      复制
+                    </button>
+                  </div>
+                </div>
+              </div>
 
-        <div className="action-row about-action-row">
-          <button className="primary-button" disabled={isCheckingUpdate || isInstallingUpdate} onClick={updateInfo?.available ? onInstallUpdate : onCheckUpdate}>
-            {aboutPrimaryLabel}
-          </button>
-          <button className="ghost-button" onClick={onCopyVersion}>
-            复制版本号
-          </button>
-          <button className="ghost-button" onClick={onClose}>
-            关闭
-          </button>
-        </div>
+              <div className="about-notes-block">
+                <div className="section-title compact-title">
+                  <div>
+                    <p className="eyebrow">更新说明</p>
+                    <h3>{updateInfo?.version ? `v${updateInfo.version}` : "尚未获取更新说明"}</h3>
+                  </div>
+                </div>
+                <div className="about-notes">
+                  {releaseNotesList.length > 0 ? (
+                    <ul className="about-notes-list">
+                      {releaseNotesList.map((note, index) => (
+                        <li key={`${note}-${index}`}>{note}</li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p>当前没有额外的更新说明。需要更细的诊断时，再看上面的链接和 latest.json。</p>
+                  )}
+                </div>
+              </div>
+            </div>
+          </details>
+        ) : null}
       </section>
     </div>
   );

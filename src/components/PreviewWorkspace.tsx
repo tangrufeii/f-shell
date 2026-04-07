@@ -20,6 +20,7 @@ type PreviewWorkspaceProps = {
   previewError: string;
   editorContent: string;
   editorLanguage: string;
+  editorThemeMode: "aurora" | "light" | "dark";
   previewDisplayMode: "edit" | "read";
   isActive: boolean;
   isSaving: boolean;
@@ -187,6 +188,7 @@ export default function PreviewWorkspace({
   previewError,
   editorContent,
   editorLanguage,
+  editorThemeMode,
   previewDisplayMode,
   isActive,
   accessNotice,
@@ -243,6 +245,7 @@ export default function PreviewWorkspace({
               <LazyCodeEditor
                 className="editor"
                 language={editorLanguage}
+                themeMode={editorThemeMode}
                 onChange={onEditorChange}
                 onMount={onEditorMount}
                 onSave={onSave}

@@ -14,6 +14,7 @@ fn main() {
         .manage(state::AppState::default())
         .invoke_handler(tauri::generate_handler![
             commands::get_shell_overview,
+            commands::get_remote_system_snapshot,
             commands::check_app_update,
             commands::inspect_update_feed,
             commands::install_app_update,

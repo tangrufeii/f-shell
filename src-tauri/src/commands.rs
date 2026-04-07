@@ -12,7 +12,7 @@ use std::{
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use rfd::FileDialog;
 use serde::Deserialize;
-use ssh2::{FileStat, OpenFlags, OpenType, Session};
+use ssh2::{FileStat, MethodType, OpenFlags, OpenType, Session};
 use tauri::{AppHandle, Emitter, Manager, State};
 #[cfg(desktop)]
 use tauri_plugin_updater::UpdaterExt;
@@ -22,7 +22,7 @@ use crate::{
     models::{
         AppUpdateFeedInfo, AppUpdateInfo, AppUpdateInstallResponse, AppUpdateProgress, ConnectRequest,
         ConnectionProgress, ConnectionSummary, DownloadResponse, FileActionResponse, FilePreview,
-        RemoteEntry, SaveResponse, ShellOverview, TerminalChunk, TerminalStatus, UploadResponse,
+        RemoteEntry, RemoteProcessStat, RemoteSystemSnapshot, SaveResponse, ShellOverview, TerminalChunk, TerminalStatus, UploadResponse,
     },
     state::{AppState, StoredConnection, TerminalCommand, TerminalHandle},
 };
@@ -32,6 +32,23 @@ const IMAGE_PREVIEW_LIMIT: u64 = 12 * 1024 * 1024;
 const SSH_CONNECT_TIMEOUT: Duration = Duration::from_secs(6);
 const SSH_IO_TIMEOUT: Duration = Duration::from_secs(12);
 const CONNECT_TOTAL_STEPS: u8 = 5;
+const SSH_KEEPALIVE_INTERVAL_SECS: u32 = 15;
+const SHELL_PROMPT_WAKE_DELAY: Duration = Duration::from_millis(420);
+const SHELL_PROMPT_HINT_DELAY: Duration = Duration::from_millis(1400);
+const LEGACY_KEX_PREFS: &str =
+    "diffie-hellman-group14-sha1,diffie-hellman-group1-sha1,diffie-hellman-group-exchange-sha1,diffie-hellman-group-exchange-sha256";
+const LEGACY_HOSTKEY_PREFS: &str =
+    "ssh-rsa,ssh-dss,rsa-sha2-256,rsa-sha2-512,ecdsa-sha2-nistp256,ssh-ed25519";
+const LEGACY_CRYPT_PREFS: &str =
+    "aes128-ctr,aes192-ctr,aes256-ctr,aes128-cbc,3des-cbc,aes192-cbc,aes256-cbc";
+const LEGACY_MAC_PREFS: &str = "hmac-sha1,hmac-sha1-96,hmac-md5,hmac-sha2-256,hmac-sha2-512";
+const LEGACY_SIGN_PREFS: &str = "ssh-rsa,rsa-sha2-256,rsa-sha2-512";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SshHandshakeProfile {
+    Default,
+    LegacyCompat,
+}
 
 #[tauri::command]
 pub async fn inspect_update_feed(endpoint: String) -> Result<AppUpdateFeedInfo, String> {
@@ -284,6 +301,19 @@ pub fn get_shell_overview(state: State<'_, AppState>) -> Result<ShellOverview, S
 }
 
 #[tauri::command]
+pub async fn get_remote_system_snapshot(
+    state: State<'_, AppState>,
+) -> Result<RemoteSystemSnapshot, String> {
+    let connection = active_connection(&state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let session = connect_from_stored(&connection)?;
+        read_remote_system_snapshot(&session)
+    })
+    .await
+    .map_err(|error| format!("远端系统信息任务被中断了: {error}"))?
+}
+
+#[tauri::command]
 pub async fn connect_ssh(app: AppHandle, request: ConnectRequest) -> Result<ConnectionSummary, String> {
     let blocking_app = app.clone();
     tauri::async_runtime::spawn_blocking(move || connect_ssh_blocking(blocking_app, request))
@@ -320,6 +350,7 @@ fn connect_ssh_blocking(app: AppHandle, request: ConnectRequest) -> Result<Conne
 
         let started_at = Instant::now();
         let session = create_authenticated_session(&app, &request)?;
+        let file_session = create_authenticated_session_silent(&request)?;
         emit_connection_progress(
             &app,
             ConnectionProgress {
@@ -394,6 +425,10 @@ fn connect_ssh_blocking(app: AppHandle, request: ConnectRequest) -> Result<Conne
 
         *lock_connection(&state)? = Some(stored);
         *state
+            .file_session
+            .lock()
+            .map_err(|_| "文件会话状态锁坏了".to_string())? = Some(file_session);
+        *state
             .terminal
             .lock()
             .map_err(|_| "终端状态锁坏了".to_string())? = Some(TerminalHandle { sender: tx });
@@ -451,6 +486,28 @@ fn clear_connection_state(state: &State<'_, AppState>) -> Result<(), String> {
         let _ = handle.sender.send(TerminalCommand::Close);
     }
 
+    *state
+        .file_session
+        .lock()
+        .map_err(|_| "文件会话状态锁坏了".to_string())? = None;
+    *lock_connection(&state)? = None;
+    *state
+        .current_path
+        .lock()
+        .map_err(|_| "路径状态锁坏了".to_string())? = None;
+    Ok(())
+}
+
+fn clear_runtime_connection_state(app: &AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    *state
+        .file_session
+        .lock()
+        .map_err(|_| "文件会话状态锁坏了".to_string())? = None;
+    *state
+        .terminal
+        .lock()
+        .map_err(|_| "终端状态锁坏了".to_string())? = None;
     *lock_connection(&state)? = None;
     *state
         .current_path
@@ -494,29 +551,40 @@ pub fn resize_terminal(state: State<'_, AppState>, cols: u16, rows: u16) -> Resu
 }
 
 #[tauri::command]
-pub fn read_remote_dir(state: State<'_, AppState>, path: String) -> Result<Vec<RemoteEntry>, String> {
+pub async fn read_remote_dir(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<Vec<RemoteEntry>, String> {
     let connection = active_connection(&state)?;
+    let session = active_file_session(&state)?;
     let normalized_path = normalize_remote_path(&path);
-    let session = connect_from_stored(&connection)?;
-    let sftp = session.sftp().map_err(to_error)?;
-    let mut entries = sftp
-        .readdir(Path::new(&normalized_path))
-        .map_err(to_error)?
-        .into_iter()
-        .filter_map(|(entry_path, stat)| map_entry(&entry_path, &stat, &connection))
-        .collect::<Vec<_>>();
+    let path_for_state = normalized_path.clone();
 
-    entries.sort_by(|left, right| {
-        right
-            .is_dir
-            .cmp(&left.is_dir)
-            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
-    });
+    let entries = tauri::async_runtime::spawn_blocking(move || {
+        let sftp = session.sftp().map_err(to_error)?;
+        let mut entries = sftp
+            .readdir(Path::new(&normalized_path))
+            .map_err(to_error)?
+            .into_iter()
+            .filter_map(|(entry_path, stat)| map_entry(&entry_path, &stat, &connection))
+            .collect::<Vec<_>>();
+
+        entries.sort_by(|left, right| {
+            right
+                .is_dir
+                .cmp(&left.is_dir)
+                .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+        });
+
+        Ok::<Vec<RemoteEntry>, String>(entries)
+    })
+    .await
+    .map_err(|error| format!("远端目录读取任务被中断了: {error}"))??;
 
     *state
         .current_path
         .lock()
-        .map_err(|_| "路径状态锁坏了".to_string())? = Some(normalized_path);
+        .map_err(|_| "路径状态锁坏了".to_string())? = Some(path_for_state);
 
     Ok(entries)
 }
@@ -527,7 +595,7 @@ pub fn preview_remote_file(
     path: String,
 ) -> Result<FilePreview, String> {
     let connection = active_connection(&state)?;
-    let session = connect_from_stored(&connection)?;
+    let session = active_file_session(&state)?;
     let sftp = session.sftp().map_err(to_error)?;
     let stat = sftp.stat(Path::new(&path)).map_err(to_error)?;
 
@@ -647,8 +715,7 @@ pub fn save_remote_file(
     path: String,
     content: String,
 ) -> Result<SaveResponse, String> {
-    let connection = active_connection(&state)?;
-    let session = connect_from_stored(&connection)?;
+    let session = active_file_session(&state)?;
     let sftp = session.sftp().map_err(to_error)?;
     let mut file = sftp
         .create(Path::new(&path))
@@ -680,8 +747,7 @@ pub fn upload_remote_file(
         .decode(base64_data.as_bytes())
         .map_err(|error| format!("上传文件 `{sanitized_name}` 失败：base64 解码错误，{error}"))?;
 
-    let connection = active_connection(&state)?;
-    let session = connect_from_stored(&connection)?;
+    let session = active_file_session(&state)?;
     let sftp = session.sftp().map_err(to_error)?;
     write_remote_payload(&sftp, &remote_path, &payload)?;
 
@@ -717,8 +783,7 @@ pub fn upload_windows_clipboard_files(
             return Ok(Vec::new());
         }
 
-        let connection = active_connection(&state)?;
-        let session = connect_from_stored(&connection)?;
+        let session = active_file_session(&state)?;
         let sftp = session.sftp().map_err(to_error)?;
         let mut responses = Vec::new();
 
@@ -780,8 +845,7 @@ pub fn download_remote_entry(
     suggested_name: String,
     is_dir: bool,
 ) -> Result<DownloadResponse, String> {
-    let connection = active_connection(&state)?;
-    let session = connect_from_stored(&connection)?;
+    let session = active_file_session(&state)?;
     let sftp = session.sftp().map_err(to_error)?;
 
     let destination = if is_dir {
@@ -821,8 +885,7 @@ pub fn create_remote_directory(
 ) -> Result<FileActionResponse, String> {
     let validated_name = validate_remote_entry_name(&name)?;
     let remote_dir = join_remote_path(&parent_dir, &validated_name);
-    let connection = active_connection(&state)?;
-    let session = connect_from_stored(&connection)?;
+    let session = active_file_session(&state)?;
     let sftp = session.sftp().map_err(to_error)?;
 
     sftp.mkdir(Path::new(&remote_dir), 0o755)
@@ -842,8 +905,7 @@ pub fn create_remote_file(
 ) -> Result<FileActionResponse, String> {
     let validated_name = validate_remote_entry_name(&name)?;
     let remote_path = join_remote_path(&parent_dir, &validated_name);
-    let connection = active_connection(&state)?;
-    let session = connect_from_stored(&connection)?;
+    let session = active_file_session(&state)?;
     let sftp = session.sftp().map_err(to_error)?;
     let mut file = sftp
         .open_mode(
@@ -881,8 +943,7 @@ pub fn rename_remote_entry(
         });
     }
 
-    let connection = active_connection(&state)?;
-    let session = connect_from_stored(&connection)?;
+    let session = active_file_session(&state)?;
     let sftp = session.sftp().map_err(to_error)?;
 
     sftp.rename(Path::new(&source_path), Path::new(&target_path), None)
@@ -901,8 +962,7 @@ pub fn delete_remote_entry(
     is_dir: bool,
 ) -> Result<FileActionResponse, String> {
     let remote_path = normalize_remote_path(&path);
-    let connection = active_connection(&state)?;
-    let session = connect_from_stored(&connection)?;
+    let session = active_file_session(&state)?;
     let sftp = session.sftp().map_err(to_error)?;
 
     if is_dir {
@@ -920,7 +980,7 @@ pub fn delete_remote_entry(
 
 fn spawn_terminal_worker(
     app: AppHandle,
-    _session: Session,
+    session: Session,
     mut channel: ssh2::Channel,
     rx: mpsc::Receiver<TerminalCommand>,
 ) {
@@ -934,15 +994,23 @@ fn spawn_terminal_worker(
         );
 
         let mut buffer = [0_u8; 8192];
+        let started_at = Instant::now();
+        let mut last_keepalive_at = Instant::now();
+        let mut received_initial_output = false;
+        let mut auto_prompt_wake_sent = false;
+        let mut prompt_hint_emitted = false;
+        let mut close_message = "SSH 会话已关闭".to_string();
         loop {
             match channel.read(&mut buffer) {
                 Ok(size) if size > 0 => {
+                    received_initial_output = true;
                     let payload = String::from_utf8_lossy(&buffer[..size]).to_string();
                     let _ = app.emit("terminal-chunk", TerminalChunk { data: payload });
                 }
                 Ok(_) => {}
                 Err(error) if error.kind() == ErrorKind::WouldBlock => {}
                 Err(error) => {
+                    close_message = format!("SSH 会话已断开，终端读取失败: {error}");
                     let _ = app.emit(
                         "terminal-status",
                         TerminalStatus {
@@ -957,6 +1025,7 @@ fn spawn_terminal_worker(
             match rx.try_recv() {
                 Ok(TerminalCommand::Input(data)) => {
                     if let Err(error) = write_until_ready(&mut channel, data.as_bytes()) {
+                        close_message = format!("SSH 会话已断开，终端写入失败: {error}");
                         let _ = app.emit(
                             "terminal-status",
                             TerminalStatus {
@@ -984,6 +1053,7 @@ fn spawn_terminal_worker(
                     }
                 }
                 Ok(TerminalCommand::Close) => {
+                    close_message = "SSH 会话已断开".into();
                     let _ = channel.close();
                     break;
                 }
@@ -991,18 +1061,77 @@ fn spawn_terminal_worker(
                 Err(mpsc::TryRecvError::Disconnected) => break,
             }
 
+            if !received_initial_output && !auto_prompt_wake_sent && started_at.elapsed() >= SHELL_PROMPT_WAKE_DELAY {
+                match write_until_ready(&mut channel, b"\n") {
+                    Ok(()) => {
+                        auto_prompt_wake_sent = true;
+                        let _ = app.emit(
+                            "terminal-status",
+                            TerminalStatus {
+                                kind: "warning".into(),
+                                message: "远端终端首屏没有返回提示符，已自动发送回车尝试唤起命令行。".into(),
+                            },
+                        );
+                    }
+                    Err(error) => {
+                        let _ = app.emit(
+                            "terminal-status",
+                            TerminalStatus {
+                                kind: "warning".into(),
+                                message: format!("远端终端暂时没回提示符，自动唤起失败: {error}"),
+                            },
+                        );
+                        auto_prompt_wake_sent = true;
+                    }
+                }
+            }
+
+            if !received_initial_output
+                && auto_prompt_wake_sent
+                && !prompt_hint_emitted
+                && started_at.elapsed() >= SHELL_PROMPT_HINT_DELAY
+            {
+                let _ = app.emit(
+                    "terminal-status",
+                    TerminalStatus {
+                        kind: "warning".into(),
+                        message: "如果终端区域还是空白，可再按一次回车唤起远端命令行。".into(),
+                    },
+                );
+                prompt_hint_emitted = true;
+            }
+
+            if last_keepalive_at.elapsed() >= Duration::from_secs(u64::from(SSH_KEEPALIVE_INTERVAL_SECS)) {
+                if let Err(error) = session.keepalive_send() {
+                    close_message = format!("SSH 会话已断开，保活探测失败: {error}");
+                    let _ = app.emit(
+                        "terminal-status",
+                        TerminalStatus {
+                            kind: "error".into(),
+                            message: format!("SSH 保活失败，连接可能已经断开: {error}"),
+                        },
+                    );
+                    break;
+                }
+                last_keepalive_at = Instant::now();
+            }
+
             if channel.eof() {
+                if close_message == "SSH 会话已关闭" {
+                    close_message = "SSH 会话已断开，可能是远端 shell 退出或网络中断。".into();
+                }
                 break;
             }
 
             thread::sleep(Duration::from_millis(12));
         }
 
+        let _ = clear_runtime_connection_state(&app);
         let _ = app.emit(
             "terminal-status",
             TerminalStatus {
                 kind: "closed".into(),
-                message: "SSH 会话已关闭".into(),
+                message: close_message,
             },
         );
     });
@@ -1071,16 +1200,62 @@ fn create_authenticated_session_silent(request: &ConnectRequest) -> Result<Sessi
     create_authenticated_session_inner(request, None)
 }
 
-fn create_authenticated_session_inner(
-    request: &ConnectRequest,
-    app: Option<&AppHandle>,
-) -> Result<Session, String> {
+fn prefers_legacy_ssh_compat(raw: &str) -> bool {
+    let lower = raw.to_lowercase();
+    lower.contains("unable to exchange encryption keys")
+        || lower.contains("kex failure")
+        || lower.contains("no matching")
+        || lower.contains("algorithm")
+}
+
+fn apply_ssh_handshake_profile(session: &Session, profile: SshHandshakeProfile) -> Result<(), String> {
+    if profile == SshHandshakeProfile::Default {
+        return Ok(());
+    }
+
+    session
+        .method_pref(MethodType::Kex, LEGACY_KEX_PREFS)
+        .map_err(|error| format!("设置 SSH KEX 兼容算法失败: {error}"))?;
+    session
+        .method_pref(MethodType::HostKey, LEGACY_HOSTKEY_PREFS)
+        .map_err(|error| format!("设置 SSH HostKey 兼容算法失败: {error}"))?;
+    session
+        .method_pref(MethodType::CryptCs, LEGACY_CRYPT_PREFS)
+        .map_err(|error| format!("设置 SSH 加密算法失败: {error}"))?;
+    session
+        .method_pref(MethodType::CryptSc, LEGACY_CRYPT_PREFS)
+        .map_err(|error| format!("设置 SSH 回传加密算法失败: {error}"))?;
+    session
+        .method_pref(MethodType::MacCs, LEGACY_MAC_PREFS)
+        .map_err(|error| format!("设置 SSH MAC 算法失败: {error}"))?;
+    session
+        .method_pref(MethodType::MacSc, LEGACY_MAC_PREFS)
+        .map_err(|error| format!("设置 SSH 回传 MAC 算法失败: {error}"))?;
+    session
+        .method_pref(MethodType::SignAlgo, LEGACY_SIGN_PREFS)
+        .map_err(|error| format!("设置 SSH 签名算法失败: {error}"))?;
+    Ok(())
+}
+
+fn create_handshaked_session(request: &ConnectRequest, profile: SshHandshakeProfile) -> Result<Session, String> {
     let tcp = connect_tcp_stream(request)?;
     tcp.set_read_timeout(Some(SSH_IO_TIMEOUT))
         .map_err(|error| format!("设置 TCP 读取超时失败: {error}"))?;
     tcp.set_write_timeout(Some(SSH_IO_TIMEOUT))
         .map_err(|error| format!("设置 TCP 写入超时失败: {error}"))?;
 
+    let mut session = Session::new().map_err(to_error)?;
+    session.set_timeout(SSH_IO_TIMEOUT.as_millis() as u32);
+    session.set_tcp_stream(tcp);
+    apply_ssh_handshake_profile(&session, profile)?;
+    session.handshake().map_err(|error| error.to_string())?;
+    Ok(session)
+}
+
+fn create_authenticated_session_inner(
+    request: &ConnectRequest,
+    app: Option<&AppHandle>,
+) -> Result<Session, String> {
     if let Some(app) = app {
         emit_connection_progress(
             app,
@@ -1097,12 +1272,34 @@ fn create_authenticated_session_inner(
         );
     }
 
-    let mut session = Session::new().map_err(to_error)?;
-    session.set_timeout(SSH_IO_TIMEOUT.as_millis() as u32);
-    session.set_tcp_stream(tcp);
-    session
-        .handshake()
-        .map_err(|error| explain_ssh_handshake_error(&request.host, request.port, error))?;
+    let session = match create_handshaked_session(request, SshHandshakeProfile::Default) {
+        Ok(session) => session,
+        Err(raw_error) => {
+            if prefers_legacy_ssh_compat(&raw_error) {
+                if let Some(app) = app {
+                    emit_connection_progress(
+                        app,
+                        ConnectionProgress {
+                            stage: "handshake".into(),
+                            message: "默认 SSH 算法没谈拢，正在尝试兼容旧版服务器...".into(),
+                            detail: Some(
+                                "有些老机器只认旧的 KEX / HostKey / Cipher，FinalShell 能连上多半就是因为它会自动降级。".into(),
+                            ),
+                            current_step: 2,
+                            total_steps: CONNECT_TOTAL_STEPS,
+                            is_error: false,
+                        },
+                    );
+                }
+
+                create_handshaked_session(request, SshHandshakeProfile::LegacyCompat).map_err(|legacy_error| {
+                    explain_ssh_handshake_error(&request.host, request.port, &legacy_error, true)
+                })?
+            } else {
+                return Err(explain_ssh_handshake_error(&request.host, request.port, &raw_error, false));
+            }
+        }
+    };
 
     if let Some(app) = app {
         emit_connection_progress(
@@ -1125,6 +1322,8 @@ fn create_authenticated_session_inner(
     if !session.authenticated() {
         return Err("SSH 鉴权失败，请检查账号密码。".into());
     }
+
+    session.set_keepalive(false, SSH_KEEPALIVE_INTERVAL_SECS);
 
     Ok(session)
 }
@@ -1169,6 +1368,159 @@ fn run_remote_command(session: &Session, command: &str) -> Result<String, String
     }
 
     Ok(output)
+}
+
+fn parse_cpu_stat_line(line: &str) -> Result<(u64, u64), String> {
+    let values = line
+        .split_whitespace()
+        .skip(1)
+        .map(|value| value.parse::<u64>().map_err(|error| format!("解析 CPU 采样失败: {error}")))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if values.len() < 5 {
+        return Err("CPU 采样字段不够，没法计算占用率。".into());
+    }
+
+    let total = values.iter().sum::<u64>();
+    let idle = values.get(3).copied().unwrap_or_default() + values.get(4).copied().unwrap_or_default();
+    Ok((idle, total))
+}
+
+fn parse_net_dev_line(line: &str) -> Result<(u64, u64), String> {
+    let values = line
+        .split_whitespace()
+        .map(|value| value.parse::<u64>().map_err(|error| format!("解析网络流量采样失败: {error}")))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if values.len() < 2 {
+        return Err("网络流量采样字段不够。".into());
+    }
+
+    Ok((values[0], values[1]))
+}
+
+fn parse_remote_process_stat(line: &str) -> Option<RemoteProcessStat> {
+    let mut parts = line.split_whitespace();
+    let command = parts.next()?.trim();
+    let cpu_percent = parts.next()?.parse::<f64>().ok()?;
+    let memory_percent = parts.next()?.parse::<f64>().ok()?;
+
+    Some(RemoteProcessStat {
+        command: command.to_string(),
+        cpu_percent,
+        memory_percent,
+    })
+}
+
+fn read_remote_system_snapshot(session: &Session) -> Result<RemoteSystemSnapshot, String> {
+    let output = run_remote_command(
+        session,
+        r#"sh -lc "grep '^cpu ' /proc/stat; sleep 0.2; grep '^cpu ' /proc/stat; getconf _NPROCESSORS_ONLN 2>/dev/null || grep -c '^processor' /proc/cpuinfo; awk -F': ' '/^model name/ {print \$2; found=1; exit} END {if (!found) print \"Unknown CPU\"}' /proc/cpuinfo; cat /proc/loadavg; cut -d' ' -f1 /proc/uptime; awk '/^MemTotal:/ {print \$2} /^MemAvailable:/ {print \$2}' /proc/meminfo; df -kPT / | tail -n 1; awk -F'[: ]+' '\$1 !~ /^(Inter|face|lo)$/ && \$2 > 0 {rx += \$2; tx += \$10} END {print rx+0, tx+0}' /proc/net/dev; sleep 0.3; awk -F'[: ]+' '\$1 !~ /^(Inter|face|lo)$/ && \$2 > 0 {rx += \$2; tx += \$10} END {print rx+0, tx+0}' /proc/net/dev; ps -eo comm=,%cpu=,%mem= --sort=-%cpu | head -n 5""#,
+    )?;
+    let lines = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+
+    if lines.len() < 11 {
+        return Err(format!("远端系统信息返回不完整，当前只拿到 {} 行。", lines.len()));
+    }
+
+    let (idle_1, total_1) = parse_cpu_stat_line(lines[0])?;
+    let (idle_2, total_2) = parse_cpu_stat_line(lines[1])?;
+    let diff_total = total_2.saturating_sub(total_1);
+    let diff_idle = idle_2.saturating_sub(idle_1);
+    let cpu_percent = if diff_total == 0 {
+        0.0
+    } else {
+        ((diff_total.saturating_sub(diff_idle)) as f64 * 100.0) / diff_total as f64
+    };
+
+    let cpu_core_count = lines[2]
+        .parse::<u32>()
+        .map_err(|error| format!("解析 CPU 核心数失败: {error}"))?;
+    let cpu_model = lines[3].to_string();
+    let load_average = lines[4]
+        .split_whitespace()
+        .take(3)
+        .map(|value| value.parse::<f64>().map_err(|error| format!("解析负载失败: {error}")))
+        .collect::<Result<Vec<_>, _>>()?;
+    if load_average.len() != 3 {
+        return Err("远端负载信息不完整。".into());
+    }
+
+    let uptime_seconds = lines[5]
+        .split('.')
+        .next()
+        .unwrap_or("0")
+        .parse::<u64>()
+        .map_err(|error| format!("解析运行时长失败: {error}"))?;
+    let memory_total_kb = lines[6]
+        .parse::<u64>()
+        .map_err(|error| format!("解析总内存失败: {error}"))?;
+    let memory_available_kb = lines[7]
+        .parse::<u64>()
+        .map_err(|error| format!("解析可用内存失败: {error}"))?;
+    let memory_used_kb = memory_total_kb.saturating_sub(memory_available_kb);
+    let memory_usage_percent = if memory_total_kb == 0 {
+        0.0
+    } else {
+        memory_used_kb as f64 * 100.0 / memory_total_kb as f64
+    };
+
+    let root_parts = lines[8].split_whitespace().collect::<Vec<_>>();
+    if root_parts.len() < 7 {
+        return Err("根分区容量信息不完整。".into());
+    }
+    let root_file_system_type = root_parts[1].to_string();
+    let root_total_kb = root_parts[2]
+        .parse::<u64>()
+        .map_err(|error| format!("解析根分区总容量失败: {error}"))?;
+    let root_used_kb = root_parts[3]
+        .parse::<u64>()
+        .map_err(|error| format!("解析根分区已用容量失败: {error}"))?;
+    let root_available_kb = root_parts[4]
+        .parse::<u64>()
+        .map_err(|error| format!("解析根分区剩余容量失败: {error}"))?;
+    let root_usage_percent = root_parts[5]
+        .trim_end_matches('%')
+        .parse::<f64>()
+        .map_err(|error| format!("解析根分区占用率失败: {error}"))?;
+    let root_mount_path = root_parts[6].to_string();
+    let (net_rx_1, net_tx_1) = parse_net_dev_line(lines[9])?;
+    let (net_rx_2, net_tx_2) = parse_net_dev_line(lines[10])?;
+    let network_interval_seconds = 0.3_f64;
+    let network_rx_bytes_per_sec = net_rx_2.saturating_sub(net_rx_1) as f64 / network_interval_seconds;
+    let network_tx_bytes_per_sec = net_tx_2.saturating_sub(net_tx_1) as f64 / network_interval_seconds;
+    let top_processes = lines
+        .iter()
+        .skip(11)
+        .filter_map(|line| parse_remote_process_stat(line))
+        .filter(|item| item.command != "ps" && item.command != "awk" && item.command != "sh")
+        .take(3)
+        .collect::<Vec<_>>();
+
+    Ok(RemoteSystemSnapshot {
+        cpu_percent,
+        cpu_core_count,
+        cpu_model,
+        load_average,
+        uptime_seconds,
+        memory_total_bytes: memory_total_kb.saturating_mul(1024),
+        memory_available_bytes: memory_available_kb.saturating_mul(1024),
+        memory_used_bytes: memory_used_kb.saturating_mul(1024),
+        memory_usage_percent,
+        root_total_bytes: root_total_kb.saturating_mul(1024),
+        root_available_bytes: root_available_kb.saturating_mul(1024),
+        root_used_bytes: root_used_kb.saturating_mul(1024),
+        root_usage_percent,
+        root_mount_path,
+        root_file_system_type,
+        network_rx_bytes_per_sec,
+        network_tx_bytes_per_sec,
+        top_processes,
+    })
 }
 
 fn download_remote_file_to_path(
@@ -1433,6 +1785,32 @@ fn active_connection(state: &State<'_, AppState>) -> Result<StoredConnection, St
         .ok_or_else(|| "当前没有活动连接，请先登录 SSH。".to_string())
 }
 
+fn active_file_session(state: &State<'_, AppState>) -> Result<Session, String> {
+    if let Some(session) = state
+        .file_session
+        .lock()
+        .map_err(|_| "文件会话状态锁坏了".to_string())?
+        .as_ref()
+        .cloned()
+    {
+        return Ok(session);
+    }
+
+    let connection = active_connection(state)?;
+    let session = connect_from_stored(&connection)?;
+    let mut file_session = state
+        .file_session
+        .lock()
+        .map_err(|_| "文件会话状态锁坏了".to_string())?;
+
+    if let Some(existing) = file_session.as_ref().cloned() {
+        return Ok(existing);
+    }
+
+    *file_session = Some(session.clone());
+    Ok(session)
+}
+
 fn lock_connection<'a>(
     state: &'a State<'_, AppState>,
 ) -> Result<MutexGuard<'a, Option<StoredConnection>>, String> {
@@ -1553,6 +1931,7 @@ fn explain_ssh_handshake_error(
     host: &str,
     port: u16,
     error: impl std::fmt::Display,
+    legacy_compat_attempted: bool,
 ) -> String {
     let raw = error.to_string();
     let lower = raw.to_lowercase();
@@ -1567,6 +1946,22 @@ fn explain_ssh_handshake_error(
         return format!(
             "SSH 握手 `{host}:{port}` 失败：服务端返回的 SSH banner 不对劲，端口可能根本不是 SSH。原始错误：{raw}"
         );
+    }
+
+    if lower.contains("unable to exchange encryption keys")
+        || lower.contains("kex failure")
+        || lower.contains("no matching")
+        || lower.contains("algorithm")
+    {
+        return if legacy_compat_attempted {
+            format!(
+                "SSH 握手 `{host}:{port}` 失败：默认算法和旧版兼容算法都没谈拢。这个服务端大概率用了很老或很怪的 SSH 配置，需要继续补更激进的兼容策略。原始错误：{raw}"
+            )
+        } else {
+            format!(
+                "SSH 握手 `{host}:{port}` 失败：加密算法协商没谈拢，服务端可能只支持旧版 KEX / HostKey / Cipher。原始错误：{raw}"
+            )
+        };
     }
 
     format!("SSH 握手 `{host}:{port}` 失败: {raw}")

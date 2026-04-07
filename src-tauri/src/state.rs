@@ -1,5 +1,7 @@
 use std::sync::{mpsc::Sender, Mutex};
 
+use ssh2::Session;
+
 use crate::models::ConnectionSummary;
 
 #[derive(Debug, Clone)]
@@ -26,9 +28,10 @@ pub struct TerminalHandle {
     pub sender: Sender<TerminalCommand>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct AppState {
     pub connection: Mutex<Option<StoredConnection>>,
+    pub file_session: Mutex<Option<Session>>,
     pub terminal: Mutex<Option<TerminalHandle>>,
     pub current_path: Mutex<Option<String>>,
     pub recent_files: Mutex<Vec<String>>,

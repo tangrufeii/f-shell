@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type Ref } from "react";
+import { useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type Ref } from "react";
 import type { CommandHistoryItem } from "../types";
 
 type TerminalToolbarProps = {
@@ -11,7 +11,7 @@ type TerminalToolbarProps = {
   historySelection: string;
   historyTriggerSummary: string;
   currentDirectoryPath: string;
-  commandDraft: string;
+  hasCommandDraft: boolean;
   searchQuery: string;
   searchResultCount: number;
   searchCounterLabel: string;
@@ -31,6 +31,48 @@ type TerminalToolbarProps = {
   onClearTerminal: () => void;
   formatHistoryTime: (value: string) => string;
 };
+
+function HistoryOptionRow({
+  item,
+  historySelection,
+  onUseHistoryCommand,
+  onCopyCommand,
+  onToggleFavorite,
+  formatHistoryTime
+}: {
+  item: CommandHistoryItem;
+  historySelection: string;
+  onUseHistoryCommand: (command: string) => void;
+  onCopyCommand: (command: string) => void;
+  onToggleFavorite: (command: string, cwd: string) => void;
+  formatHistoryTime: (value: string) => string;
+}) {
+  return (
+    <div className={`history-option-row ${historySelection === item.command ? "active" : ""}`}>
+      <button
+        className="history-option-main"
+        onClick={() => onUseHistoryCommand(item.command)}
+        title={item.command}
+      >
+        <span className="history-option-command">{item.command}</span>
+        <span className="history-option-meta">
+          <span>{item.cwd}</span>
+          <span>{formatHistoryTime(item.updatedAt)}</span>
+        </span>
+      </button>
+      <button className="history-option-copy" onClick={() => onCopyCommand(item.command)} title="复制命令">
+        复制
+      </button>
+      <button
+        className={`history-option-favorite ${item.favorite ? "active" : ""}`}
+        onClick={() => onToggleFavorite(item.command, item.cwd)}
+        title={item.favorite ? "取消收藏命令" : "收藏命令"}
+      >
+        {item.favorite ? "★" : "☆"}
+      </button>
+    </div>
+  );
+}
 
 function HistorySection({
   title,
@@ -56,34 +98,19 @@ function HistorySection({
   return (
     <div className="history-section">
       <div className="history-section-label">{title}</div>
-      {items.map((item) => (
-        <div
-          key={`${item.cwd}:${item.command}`}
-          className={`history-option-row ${historySelection === item.command ? "active" : ""}`}
-        >
-          <button
-            className="history-option-main"
-            onClick={() => onUseHistoryCommand(item.command)}
-            title={item.command}
-          >
-            <span className="history-option-command">{item.command}</span>
-            <span className="history-option-meta">
-              <span>{item.cwd}</span>
-              <span>{formatHistoryTime(item.updatedAt)}</span>
-            </span>
-          </button>
-          <button className="history-option-copy" onClick={() => onCopyCommand(item.command)} title="复制命令">
-            复制
-          </button>
-          <button
-            className={`history-option-favorite ${item.favorite ? "active" : ""}`}
-            onClick={() => onToggleFavorite(item.command, item.cwd)}
-            title={item.favorite ? "取消收藏命令" : "收藏命令"}
-          >
-            {item.favorite ? "★" : "☆"}
-          </button>
-        </div>
-      ))}
+      <div className="history-list" onWheel={(event) => event.stopPropagation()}>
+        {items.map((item) => (
+          <HistoryOptionRow
+            key={`${item.cwd}:${item.command}`}
+            item={item}
+            historySelection={historySelection}
+            onUseHistoryCommand={onUseHistoryCommand}
+            onCopyCommand={onCopyCommand}
+            onToggleFavorite={onToggleFavorite}
+            formatHistoryTime={formatHistoryTime}
+          />
+        ))}
+      </div>
     </div>
   );
 }
@@ -98,7 +125,7 @@ export default function TerminalToolbar({
   historySelection,
   historyTriggerSummary,
   currentDirectoryPath,
-  commandDraft,
+  hasCommandDraft,
   searchQuery,
   searchResultCount,
   searchCounterLabel,
@@ -137,12 +164,18 @@ export default function TerminalToolbar({
     }
   }, [isHistoryMenuOpen]);
 
-  const tabHistory =
-    historyTab === "current" ? scopedCommandHistory : historyTab === "favorites" ? favoriteCommandHistory : commandHistory;
+  const tabHistory = useMemo(
+    () => (historyTab === "current" ? scopedCommandHistory : historyTab === "favorites" ? favoriteCommandHistory : commandHistory),
+    [commandHistory, favoriteCommandHistory, historyTab, scopedCommandHistory]
+  );
   const normalizedHistoryQuery = historyQuery.trim().toLocaleLowerCase();
-  const visibleHistory = normalizedHistoryQuery
-    ? tabHistory.filter((item) => `${item.command} ${item.cwd}`.toLocaleLowerCase().includes(normalizedHistoryQuery))
-    : tabHistory;
+  const visibleHistory = useMemo(
+    () =>
+      normalizedHistoryQuery
+        ? tabHistory.filter((item) => `${item.command} ${item.cwd}`.toLocaleLowerCase().includes(normalizedHistoryQuery))
+        : tabHistory,
+    [normalizedHistoryQuery, tabHistory]
+  );
 
   return (
     <div className="bottom-toolbar">
@@ -159,7 +192,7 @@ export default function TerminalToolbar({
               <span className={`history-caret ${isHistoryMenuOpen ? "open" : ""}`}>▾</span>
             </button>
             {isHistoryMenuOpen && commandHistory.length ? (
-              <div className="history-menu glass-panel">
+              <div className="history-menu" onWheel={(event) => event.stopPropagation()}>
                 <div className="history-menu-header">
                   <strong>最近命令</strong>
                   <span>{favoriteCommandHistory.length} 条收藏 / {commandHistory.length} 条全部</span>
@@ -233,13 +266,13 @@ export default function TerminalToolbar({
               </div>
             ) : null}
           </div>
-          <button className="toolbar-button" disabled={!hasConnection || !commandDraft.trim()} onClick={onClearCurrentCommand}>
+          <button className="toolbar-button" disabled={!hasConnection || !hasCommandDraft} onClick={onClearCurrentCommand}>
             清空当前行
           </button>
           <button className="toolbar-button" disabled={!hasConnection} onClick={onRequestTabCompletion}>
             Tab 补全
           </button>
-          <button className="toolbar-button accent" disabled={!hasConnection || !commandDraft.trim()} onClick={onExecuteTerminalCommand}>
+          <button className="toolbar-button accent" disabled={!hasConnection || !hasCommandDraft} onClick={onExecuteTerminalCommand}>
             执行当前行
           </button>
         </div>

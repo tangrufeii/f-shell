@@ -32,11 +32,15 @@ type ConnectDialogProps = {
   connectedProfileId: string;
   profileSearchQuery: string;
   isConnecting: boolean;
+  isCheckingUpdate: boolean;
   hasConnection: boolean;
+  passwordStorageLabel: string;
   onClose: () => void;
   onConnect: () => void;
   onReset: () => void;
   onDisconnect: () => void;
+  onOpenUpdateEntry: () => void;
+  onOpenPasswordStorageDialog: () => void;
   onSaveCurrentProfile: () => void;
   onProfileSearchChange: (value: string) => void;
   onApplyProfile: (profile: ConnectionProfile) => void;
@@ -99,11 +103,15 @@ export default function ConnectDialog({
   connectedProfileId,
   profileSearchQuery,
   isConnecting,
+  isCheckingUpdate,
   hasConnection,
+  passwordStorageLabel,
   onClose,
   onConnect,
   onReset,
   onDisconnect,
+  onOpenUpdateEntry,
+  onOpenPasswordStorageDialog,
   onSaveCurrentProfile,
   onProfileSearchChange,
   onApplyProfile,
@@ -131,9 +139,14 @@ export default function ConnectDialog({
             <p className="eyebrow">连接</p>
             <h2>连接配置</h2>
           </div>
-          <span className={`status-pill ${hasConnection ? "live" : connectionProgress?.isError ? "" : "progress-pill"}`}>
-            {hasConnection ? "已在线" : connectionStageLabel}
-          </span>
+          <div className="section-title-actions">
+            <button className="ghost-button small" disabled={isCheckingUpdate} onClick={onOpenUpdateEntry}>
+              {isCheckingUpdate ? "检查中..." : "检查更新"}
+            </button>
+            <span className={`status-pill ${hasConnection ? "live" : connectionProgress?.isError ? "" : "progress-pill"}`}>
+              {hasConnection ? "已在线" : connectionStageLabel}
+            </span>
+          </div>
         </div>
 
         {connectError ? (
@@ -198,7 +211,12 @@ export default function ConnectDialog({
                 onKeyDown={handleEnter}
               />
               {connectFieldErrors.password ? <small>{connectFieldErrors.password}</small> : null}
-              <small className="field-hint">密码只用于当前连接，不会保存到本地配置。</small>
+              <div className="field-inline-actions">
+                <small className="field-hint">当前策略：{passwordStorageLabel}</small>
+                <button className="ghost-button small" type="button" disabled={isConnecting} onClick={onOpenPasswordStorageDialog}>
+                  设置保存方式
+                </button>
+              </div>
             </label>
           </div>
 

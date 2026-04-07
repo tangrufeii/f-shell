@@ -25,6 +25,7 @@ const languageLoaders: Partial<Record<string, () => Promise<unknown>>> = {
 type CodeEditorPaneProps = {
   className?: string;
   language: string;
+  themeMode: "aurora" | "light" | "dark";
   onChange: (value: string) => void;
   onMount: (editor: MonacoEditor.IStandaloneCodeEditor) => void;
   onSave: () => void | Promise<void>;
@@ -49,7 +50,7 @@ async function ensureEditorLanguage(language: string) {
 }
 
 function handleEditorBeforeMount(monacoInstance: Monaco) {
-  monacoInstance.editor.defineTheme("fshell-editor", {
+  monacoInstance.editor.defineTheme("fshell-editor-aurora", {
     base: "vs-dark",
     inherit: true,
     rules: [],
@@ -63,11 +64,40 @@ function handleEditorBeforeMount(monacoInstance: Monaco) {
       "editorCursor.foreground": "#ffffff"
     }
   });
+  monacoInstance.editor.defineTheme("fshell-editor-light", {
+    base: "vs",
+    inherit: true,
+    rules: [],
+    colors: {
+      "editor.background": "#f7f8fb",
+      "editor.foreground": "#152033",
+      "editorLineNumber.foreground": "#8b95a8",
+      "editorLineNumber.activeForeground": "#44516a",
+      "editor.selectionBackground": "#d9e6ff",
+      "editor.inactiveSelectionBackground": "#e7eefb",
+      "editorCursor.foreground": "#1f2a3d"
+    }
+  });
+  monacoInstance.editor.defineTheme("fshell-editor-dark", {
+    base: "vs-dark",
+    inherit: true,
+    rules: [],
+    colors: {
+      "editor.background": "#0d1117",
+      "editor.foreground": "#e6edf3",
+      "editorLineNumber.foreground": "#6b7686",
+      "editorLineNumber.activeForeground": "#c7d1db",
+      "editor.selectionBackground": "#233a5b",
+      "editor.inactiveSelectionBackground": "#1a2840",
+      "editorCursor.foreground": "#ffffff"
+    }
+  });
 }
 
 export default function CodeEditorPane({
   className = "",
   language,
+  themeMode,
   onChange,
   onMount,
   onSave,
@@ -132,7 +162,7 @@ export default function CodeEditorPane({
         wordWrap: "on"
       }}
       path={path}
-      theme="fshell-editor"
+      theme={`fshell-editor-${themeMode}`}
       value={value}
     />
   );
