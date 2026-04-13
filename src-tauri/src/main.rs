@@ -8,7 +8,8 @@ fn main() {
     tauri::Builder::default()
         .setup(|app| {
             #[cfg(desktop)]
-            app.handle().plugin(tauri_plugin_updater::Builder::new().build())?;
+            app.handle()
+                .plugin(tauri_plugin_updater::Builder::new().build())?;
             Ok(())
         })
         .manage(state::AppState::default())
@@ -20,6 +21,9 @@ fn main() {
             commands::install_app_update,
             commands::connect_ssh,
             commands::disconnect_ssh,
+            commands::list_terminal_sessions,
+            commands::create_terminal_session,
+            commands::close_terminal_session,
             commands::send_terminal_input,
             commands::resize_terminal,
             commands::read_remote_dir,

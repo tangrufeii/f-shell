@@ -33,6 +33,7 @@ import {
   type ConnectionProfile,
   type PasswordStorageMode
 } from "./lib/connectionProfiles";
+import { isLikelyRuntimeDisconnectMessage } from "./lib/runtimeConnection";
 import PreviewWorkspace, { PreviewWorkspaceActions } from "./components/PreviewWorkspace";
 import FileActionDialog from "./components/FileActionDialog";
 import AboutUpdateDialog from "./components/AboutUpdateDialog";
@@ -58,6 +59,7 @@ import type {
   SaveResponse,
   ShellOverview,
   TerminalChunk,
+  TerminalSessionSummary,
   TerminalStatus,
   UploadResponse
 } from "./types";
@@ -128,6 +130,14 @@ type ConnectIssueState = {
   tips: string[];
   rawMessage: string;
 };
+type TerminalTab = TerminalSessionSummary & {
+  hasUnreadOutput: boolean;
+};
+type TerminalTabsOverflowState = {
+  canScrollLeft: boolean;
+  canScrollRight: boolean;
+};
+type TerminalViewportSizeMap = Record<string, string>;
 
 const COMMAND_HISTORY_STORAGE_KEY = "fshell-command-history";
 const SIDEBAR_WIDTH_STORAGE_KEY = "fshell-sidebar-width";
@@ -137,6 +147,7 @@ const UPDATE_PREFERENCES_STORAGE_KEY = "fshell-update-preferences";
 const UPDATE_LAST_CHECK_STORAGE_KEY = "fshell-update-last-check";
 const UPDATE_AVAILABLE_INFO_STORAGE_KEY = "fshell-update-available-info";
 const COMMAND_HISTORY_LIMIT = 40;
+const TERMINAL_OUTPUT_LIMIT = 240_000;
 const DEFAULT_SIDEBAR_WIDTH = 460;
 const MIN_SIDEBAR_WIDTH = 360;
 const MAX_SIDEBAR_WIDTH = 760;
@@ -162,6 +173,10 @@ const defaultUpdatePreferences: UpdatePreferences = {
 
 function clampSidebarWidth(width: number): number {
   return Math.min(MAX_SIDEBAR_WIDTH, Math.max(MIN_SIDEBAR_WIDTH, Math.round(width)));
+}
+
+function terminalViewportSizeKey(cols: number, rows: number): string {
+  return `${cols}x${rows}`;
 }
 
 function readStoredSidebarWidth(): number {
@@ -993,6 +1008,56 @@ function extractCommandFromPromptLine(line: string): string | null {
   return null;
 }
 
+function collapseDuplicatePromptLine(line: string): string {
+  const duplicatePromptPatterns = [
+    /^((?:[^\s\r\n]+@[^:\r\n]+:[^\r\n]*?[#$]\s*))(?:\1)+(.*)$/,
+    /^((?:\[[^\]\r\n]+@[^\]\r\n]+\][#$]\s*))(?:\1)+(.*)$/
+  ];
+
+  for (const pattern of duplicatePromptPatterns) {
+    const matched = line.match(pattern);
+    if (matched) {
+      const prompt = matched[1] ?? "";
+      const suffix = matched[2] ?? "";
+      return `${prompt}${suffix}`;
+    }
+  }
+
+  return line;
+}
+
+function sanitizeTerminalReplayOutput(output: string): string {
+  if (!output) {
+    return output;
+  }
+
+  const lastNewlineIndex = Math.max(output.lastIndexOf("\n"), output.lastIndexOf("\r"));
+  const lineStart = lastNewlineIndex >= 0 ? lastNewlineIndex + 1 : 0;
+  const tailLine = output.slice(lineStart);
+  const normalizedTailLine = collapseDuplicatePromptLine(tailLine);
+
+  if (normalizedTailLine === tailLine) {
+    return output;
+  }
+
+  return `${output.slice(0, lineStart)}${normalizedTailLine}`;
+}
+
+function hasPromptTail(output: string): boolean {
+  const normalized = output.replace(/\r\n/g, "\n");
+  const lines = normalized.split("\n");
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index]?.trimEnd() ?? "";
+    if (!line) {
+      continue;
+    }
+
+    return extractCommandFromPromptLine(line) != null;
+  }
+
+  return false;
+}
+
 function isReasonableCommandText(command: string): boolean {
   if (!command) {
     return true;
@@ -1184,7 +1249,6 @@ function App() {
   const [sidebarWidth, setSidebarWidth] = useState(() => readStoredSidebarWidth());
   const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth);
   const [isSidebarResizing, setIsSidebarResizing] = useState(false);
-  const [overview, setOverview] = useState<ShellOverview | null>(null);
   const [connection, setConnection] = useState<ConnectionSummary | null>(null);
   const [currentPath, setCurrentPath] = useState("");
   const [entriesByPath, setEntriesByPath] = useState<EntryMap>({});
@@ -1226,15 +1290,24 @@ function App() {
   const [commandHistory, setCommandHistory] = useState<CommandHistoryItem[]>(() => readStoredHistory());
   const [historySelection, setHistorySelection] = useState("");
   const [hasCommandDraft, setHasCommandDraft] = useState(false);
+  const [terminalTabs, setTerminalTabs] = useState<TerminalTab[]>([]);
+  const [activeTerminalId, setActiveTerminalId] = useState("");
+  const [terminalTabsOverflow, setTerminalTabsOverflow] = useState<TerminalTabsOverflowState>({
+    canScrollLeft: false,
+    canScrollRight: false
+  });
   const [isHistoryMenuOpen, setIsHistoryMenuOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResultCount, setSearchResultCount] = useState(0);
   const [searchActiveIndex, setSearchActiveIndex] = useState(0);
   const [terminalContentVersion, setTerminalContentVersion] = useState(0);
   const terminalHostRef = useRef<HTMLDivElement | null>(null);
+  const terminalTabsScrollerRef = useRef<HTMLDivElement | null>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
   const hasConnectionRef = useRef(false);
+  const activeTerminalIdRef = useRef(activeTerminalId);
+  const terminalTabsRef = useRef(terminalTabs);
   const searchQueryRef = useRef(searchQuery);
   const activeWorkspaceRef = useRef(activeWorkspace);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
@@ -1244,10 +1317,16 @@ function App() {
   const fileActionInputRef = useRef<HTMLInputElement | null>(null);
   const sidebarResizeStateRef = useRef<{ startX: number; startWidth: number } | null>(null);
   const currentInputBufferRef = useRef("");
+  const terminalTabButtonRefs = useRef<Record<string, HTMLButtonElement | null>>({});
+  const terminalPromptWakeTimeoutsRef = useRef<Record<string, number>>({});
+  const terminalOutputsRef = useRef<Record<string, string>>({});
+  const terminalInputBuffersRef = useRef<Record<string, string>>({});
+  const terminalViewportSizesRef = useRef<TerminalViewportSizeMap>({});
   const terminalSearchMatchesRef = useRef<TerminalSearchMatch[]>([]);
   const previewSearchMatchesRef = useRef<TextSearchMatch[]>([]);
   const pendingTerminalDraftSyncRef = useRef(false);
   const hasAutoUpdateCheckRef = useRef(false);
+  const runtimeDisconnectHandledRef = useRef(false);
   const isNarrowWorkbench = viewportWidth <= NARROW_LAYOUT_BREAKPOINT;
   const deferredSearchQuery = useDeferredValue(searchQuery);
 
@@ -1266,6 +1345,407 @@ function App() {
   useEffect(() => {
     activeWorkspaceRef.current = activeWorkspace;
   }, [activeWorkspace]);
+
+  useEffect(() => {
+    terminalTabsRef.current = terminalTabs;
+  }, [terminalTabs]);
+
+  useEffect(() => {
+    activeTerminalIdRef.current = activeTerminalId;
+    currentInputBufferRef.current = activeTerminalId ? terminalInputBuffersRef.current[activeTerminalId] ?? "" : "";
+    if (activeTerminalId) {
+      setTerminalTabs((previous) =>
+        previous.map((item) => (item.id === activeTerminalId ? { ...item, hasUnreadOutput: false } : item))
+      );
+    }
+    setHasCommandDraft(currentInputBufferRef.current.trim().length > 0);
+  }, [activeTerminalId]);
+
+  useEffect(() => {
+    if (!activeTerminalId) {
+      return;
+    }
+
+    const tabButton = terminalTabButtonRefs.current[activeTerminalId];
+    const scroller = terminalTabsScrollerRef.current;
+    if (!tabButton || !scroller) {
+      return;
+    }
+
+    tabButton.scrollIntoView({
+      behavior: "smooth",
+      inline: "nearest",
+      block: "nearest"
+    });
+  }, [activeTerminalId, terminalTabs.length]);
+
+  useEffect(() => {
+    const scroller = terminalTabsScrollerRef.current;
+    if (!scroller) {
+      return;
+    }
+
+    const updateOverflowState = () => {
+      const maxScrollLeft = Math.max(0, scroller.scrollWidth - scroller.clientWidth);
+      setTerminalTabsOverflow({
+        canScrollLeft: scroller.scrollLeft > 4,
+        canScrollRight: scroller.scrollLeft < maxScrollLeft - 4
+      });
+    };
+
+    updateOverflowState();
+    scroller.addEventListener("scroll", updateOverflowState, { passive: true });
+    const resizeObserver =
+      typeof ResizeObserver !== "undefined"
+        ? new ResizeObserver(() => {
+            updateOverflowState();
+          })
+        : null;
+    resizeObserver?.observe(scroller);
+
+    return () => {
+      scroller.removeEventListener("scroll", updateOverflowState);
+      resizeObserver?.disconnect();
+    };
+  }, [terminalTabs.length, viewportWidth]);
+
+  function scrollTerminalTabs(direction: "left" | "right") {
+    const scroller = terminalTabsScrollerRef.current;
+    if (!scroller) {
+      return;
+    }
+
+    const distance = Math.max(180, Math.round(scroller.clientWidth * 0.45));
+    scroller.scrollBy({
+      left: direction === "left" ? -distance : distance,
+      behavior: "smooth"
+    });
+  }
+
+  function syncVisibleTerminalFromActiveTab() {
+    const terminal = terminalRef.current;
+    if (!terminal) {
+      return;
+    }
+
+    terminal.reset();
+    const terminalId = activeTerminalIdRef.current;
+    if (terminalId) {
+      const output = sanitizeTerminalReplayOutput(terminalOutputsRef.current[terminalId] ?? "");
+      terminalOutputsRef.current[terminalId] = output;
+      if (output) {
+        terminal.write(output);
+      }
+      syncDraftFromTerminalBuffer(terminalId, terminal);
+    } else {
+      terminal.writeln("FShell Terminal Ready");
+      terminal.writeln("连接成功后，这里会接到真实 SSH Shell。");
+      syncCommandDraft("", "");
+    }
+
+    if (searchQueryRef.current.trim() && activeWorkspaceRef.current === "terminal") {
+      setTerminalContentVersion((previous) => previous + 1);
+    }
+  }
+
+  function resetTerminalTabState() {
+    Object.values(terminalPromptWakeTimeoutsRef.current).forEach((timeoutId) => {
+      window.clearTimeout(timeoutId);
+    });
+    terminalPromptWakeTimeoutsRef.current = {};
+    terminalOutputsRef.current = {};
+    terminalInputBuffersRef.current = {};
+    terminalViewportSizesRef.current = {};
+    activeTerminalIdRef.current = "";
+    currentInputBufferRef.current = "";
+    setTerminalTabs([]);
+    setActiveTerminalId("");
+  }
+
+  function clearScheduledTerminalPromptWake(terminalId: string) {
+    const timeoutId = terminalPromptWakeTimeoutsRef.current[terminalId];
+    if (timeoutId) {
+      window.clearTimeout(timeoutId);
+      delete terminalPromptWakeTimeoutsRef.current[terminalId];
+    }
+  }
+
+  function syncCommandDraft(next: string, terminalId = activeTerminalIdRef.current) {
+    if (terminalId) {
+      terminalInputBuffersRef.current[terminalId] = next;
+    }
+    if (terminalId === activeTerminalIdRef.current) {
+      currentInputBufferRef.current = next;
+      const nextHasCommandDraft = next.trim().length > 0;
+      setHasCommandDraft((previous) => (previous === nextHasCommandDraft ? previous : nextHasCommandDraft));
+      setHistorySelection((previous) => (next.trim() !== previous ? "" : previous));
+    }
+  }
+
+  function appendTerminalOutput(terminalId: string, chunk: string): boolean {
+    const previous = terminalOutputsRef.current[terminalId] ?? "";
+    const combined = `${previous}${chunk}`;
+    const trimmed =
+      combined.length > TERMINAL_OUTPUT_LIMIT ? combined.slice(combined.length - TERMINAL_OUTPUT_LIMIT) : combined;
+    const sanitized = sanitizeTerminalReplayOutput(trimmed);
+    terminalOutputsRef.current[terminalId] = sanitized;
+    return sanitized !== trimmed;
+  }
+
+  function upsertTerminalTabs(nextTabs: TerminalSessionSummary[], options?: { activateId?: string }) {
+    const nextIds = new Set(nextTabs.map((item) => item.id));
+    Object.keys(terminalOutputsRef.current).forEach((terminalId) => {
+      if (!nextIds.has(terminalId)) {
+        clearScheduledTerminalPromptWake(terminalId);
+        delete terminalOutputsRef.current[terminalId];
+        delete terminalInputBuffersRef.current[terminalId];
+        delete terminalViewportSizesRef.current[terminalId];
+      }
+    });
+    nextTabs.forEach((item) => {
+      terminalOutputsRef.current[item.id] ??= "";
+      terminalInputBuffersRef.current[item.id] ??= "";
+    });
+    setTerminalTabs((previous) =>
+      nextTabs.map((item) => ({
+        ...item,
+        hasUnreadOutput: previous.find((entry) => entry.id === item.id)?.hasUnreadOutput ?? false
+      }))
+    );
+    const previousActiveTerminalId = activeTerminalIdRef.current;
+    const nextActiveTerminalId =
+      options?.activateId && nextIds.has(options.activateId)
+        ? options.activateId
+        : previousActiveTerminalId && nextIds.has(previousActiveTerminalId)
+          ? previousActiveTerminalId
+          : nextTabs[0]?.id ?? "";
+    activeTerminalIdRef.current = nextActiveTerminalId;
+    currentInputBufferRef.current = nextActiveTerminalId
+      ? terminalInputBuffersRef.current[nextActiveTerminalId] ?? ""
+      : "";
+    setActiveTerminalId(nextActiveTerminalId);
+  }
+
+  function handleRuntimeDisconnect(rawMessage: string) {
+    if (runtimeDisconnectHandledRef.current) {
+      return;
+    }
+
+    runtimeDisconnectHandledRef.current = true;
+    const message = rawMessage.trim() || "SSH 会话已断开，请重新连接。";
+    setConnection(null);
+    setConnectionProgress((previous) => ({
+      stage: "error",
+      message: "SSH 会话已断开",
+      detail: message,
+      currentStep: previous?.currentStep ?? 0,
+      totalSteps: previous?.totalSteps ?? 5,
+      isError: true
+    }));
+    setConnectError(message);
+    setStatusLine("SSH 会话已断开，请重新连接。");
+    setIsConnectModalOpen(true);
+    setIsListing(false);
+    setIsSaving(false);
+    setIsUploading(false);
+    setSaveFeedback({
+      tone: "error",
+      message: "连接已断开"
+    });
+    setFileActionDialog((previous) => (previous ? { ...previous, busy: false } : previous));
+    setTreeContextMenu(null);
+    setIsHistoryMenuOpen(false);
+    setHistorySelection("");
+    currentInputBufferRef.current = "";
+    pendingTerminalDraftSyncRef.current = false;
+    setHasCommandDraft(false);
+    resetTerminalTabState();
+    clearRemoteBrowserState();
+    terminalRef.current?.writeln(`\r\n[disconnect] ${message}\r\n`);
+    void invoke("disconnect_ssh").catch((error) => {
+      console.error(error);
+    });
+  }
+
+  function consumeRuntimeDisconnect(message: string): boolean {
+    if (!isLikelyRuntimeDisconnectMessage(message)) {
+      return false;
+    }
+
+    handleRuntimeDisconnect(message);
+    return true;
+  }
+
+  async function loadTerminalTabs(options?: { activateId?: string; createIfEmpty?: boolean }) {
+    if (!hasConnectionRef.current) {
+      resetTerminalTabState();
+      return [];
+    }
+
+    let sessions = await invoke<TerminalSessionSummary[]>("list_terminal_sessions");
+    if (!sessions.length && options?.createIfEmpty !== false) {
+      const cols = terminalRef.current?.cols ?? 120;
+      const rows = terminalRef.current?.rows ?? 32;
+      const created = await invoke<TerminalSessionSummary>("create_terminal_session", {
+        cols,
+        rows
+      });
+      terminalViewportSizesRef.current[created.id] = terminalViewportSizeKey(cols, rows);
+      sessions = [created];
+    }
+
+    upsertTerminalTabs(sessions, { activateId: options?.activateId });
+    return sessions;
+  }
+
+  function scheduleInitialTerminalPromptWake(sessions: TerminalSessionSummary[], reason: string) {
+    const targetTerminalId = sessions[0]?.id;
+    if (!targetTerminalId) {
+      return;
+    }
+
+    scheduleTerminalPromptWake(targetTerminalId, { reason });
+  }
+
+  async function sendToActiveTerminal(data: string) {
+    const terminalId = activeTerminalIdRef.current;
+    if (!terminalId) {
+      throw new Error("当前没有可用的终端窗口。");
+    }
+
+    await invoke("send_terminal_input", { terminalId, data });
+  }
+
+  async function sendToTerminal(terminalId: string, data: string) {
+    if (!terminalId) {
+      throw new Error("当前没有可用的终端窗口。");
+    }
+
+    await invoke("send_terminal_input", { terminalId, data });
+  }
+
+  async function resizeActiveTerminal(
+    cols: number,
+    rows: number,
+    options?: {
+      terminalId?: string;
+      force?: boolean;
+    }
+  ) {
+    const terminalId = options?.terminalId ?? activeTerminalIdRef.current;
+    if (!terminalId) {
+      return;
+    }
+
+    const nextViewportSize = terminalViewportSizeKey(cols, rows);
+    if (!options?.force && terminalViewportSizesRef.current[terminalId] === nextViewportSize) {
+      return;
+    }
+
+    await invoke("resize_terminal", { terminalId, cols, rows });
+    terminalViewportSizesRef.current[terminalId] = nextViewportSize;
+  }
+
+  async function createTerminalTab() {
+    if (!connection) {
+      setStatusLine("请先连接 SSH。");
+      return;
+    }
+
+    try {
+      const cols = terminalRef.current?.cols ?? 120;
+      const rows = terminalRef.current?.rows ?? 32;
+      const created = await invoke<TerminalSessionSummary>("create_terminal_session", {
+        cols,
+        rows
+      });
+      terminalViewportSizesRef.current[created.id] = terminalViewportSizeKey(cols, rows);
+      upsertTerminalTabs(
+        [
+          ...terminalTabs.map(({ id, title }) => ({ id, title })),
+          created
+        ],
+        { activateId: created.id }
+      );
+      setActiveWorkspace("terminal");
+      terminalRef.current?.focus();
+      setStatusLine(`已打开 ${created.title}，正在尝试唤起命令行提示符...`);
+      scheduleTerminalPromptWake(created.id, { reason: created.title });
+    } catch (error) {
+      console.error(error);
+      const message = String(error);
+      if (consumeRuntimeDisconnect(message)) {
+        return;
+      }
+      setStatusLine(`打开终端失败: ${message}`);
+    }
+  }
+
+  function scheduleTerminalPromptWake(
+    terminalId: string,
+    options?: {
+      reason?: string;
+      delayMs?: number;
+    }
+  ) {
+    clearScheduledTerminalPromptWake(terminalId);
+
+    const timeoutId = window.setTimeout(() => {
+      clearScheduledTerminalPromptWake(terminalId);
+
+      if (!hasConnectionRef.current || !terminalTabsRef.current.some((item) => item.id === terminalId)) {
+        return;
+      }
+
+      const output = terminalOutputsRef.current[terminalId] ?? "";
+      if (!output.trim() || hasPromptTail(output)) {
+        return;
+      }
+
+      void sendToTerminal(terminalId, "\n")
+        .then(() => {
+          if (terminalId === activeTerminalIdRef.current) {
+            setStatusLine(`${options?.reason ?? "当前终端"}正在尝试补出命令行提示符...`);
+          }
+        })
+        .catch((error) => {
+          console.error(error);
+          const message = String(error);
+          if (consumeRuntimeDisconnect(message)) {
+            return;
+          }
+          if (terminalId === activeTerminalIdRef.current) {
+            setStatusLine(`${options?.reason ?? "当前终端"}提示符唤起失败: ${message}`);
+          }
+        });
+    }, options?.delayMs ?? 880);
+
+    terminalPromptWakeTimeoutsRef.current[terminalId] = timeoutId;
+  }
+
+  async function closeTerminalTab(terminalId: string) {
+    const target = terminalTabs.find((item) => item.id === terminalId);
+    try {
+      await invoke("close_terminal_session", { terminalId });
+    } catch (error) {
+      console.error(error);
+      const message = String(error);
+      if (consumeRuntimeDisconnect(message)) {
+        return;
+      }
+      setStatusLine(`关闭终端失败: ${message}`);
+      return;
+    }
+
+    const nextTabs = terminalTabs
+      .filter((item) => item.id !== terminalId)
+      .map(({ id, title }) => ({ id, title }));
+    upsertTerminalTabs(nextTabs);
+    setStatusLine(target ? `${target.title} 已关闭` : "终端窗口已关闭");
+    if (!nextTabs.length && connection) {
+      void createTerminalTab();
+    }
+  }
 
   useEffect(() => {
     const mediaQuery = window.matchMedia?.("(prefers-color-scheme: dark)");
@@ -1671,10 +2151,7 @@ function App() {
     const timer = window.setTimeout(() => {
       fitAddonRef.current?.fit();
       if (connection && terminalRef.current) {
-        void invoke("resize_terminal", {
-          cols: terminalRef.current.cols,
-          rows: terminalRef.current.rows
-        }).catch((error) => {
+        void resizeActiveTerminal(terminalRef.current.cols, terminalRef.current.rows).catch((error) => {
           console.error(error);
         });
         terminalRef.current.focus();
@@ -1825,7 +2302,8 @@ function App() {
   }, [activeWorkspace, deferredSearchQuery, preview?.kind, searchActiveIndex]);
 
   useEffect(() => {
-    if (!terminalHostRef.current) {
+    const terminalHost = terminalHostRef.current;
+    if (!terminalHost) {
       return;
     }
 
@@ -1833,13 +2311,13 @@ function App() {
       cursorBlink: true,
       fontFamily: '"SF Mono", "JetBrains Mono", Consolas, monospace',
       fontSize: 14,
-      lineHeight: 1.1,
+      lineHeight: 1.2,
       theme: resolveTerminalTheme(appliedThemeMode)
     });
     const fitAddon = new FitAddon();
 
     terminal.loadAddon(fitAddon);
-    terminal.open(terminalHostRef.current);
+    terminal.open(terminalHost);
     terminal.attachCustomKeyEventHandler((event) => {
       if (
         event.key === "Tab" &&
@@ -1852,28 +2330,57 @@ function App() {
 
       return true;
     });
-    fitAddon.fit();
-    terminal.writeln("FShell Terminal Ready");
-    terminal.writeln("连接成功后，这里会接到真实 SSH Shell。");
-
     const resizeTerminal = () => {
       fitAddon.fit();
       if (hasConnectionRef.current) {
-        void invoke("resize_terminal", { cols: terminal.cols, rows: terminal.rows });
+        void resizeActiveTerminal(terminal.cols, terminal.rows).catch((error) => {
+          console.error(error);
+          const message = String(error);
+          if (consumeRuntimeDisconnect(message)) {
+            return;
+          }
+          setStatusLine(`终端尺寸同步失败: ${message}`);
+        });
       }
     };
+    let resizeFrame = 0;
+    const queueResizeTerminal = () => {
+      if (resizeFrame) {
+        return;
+      }
+
+      resizeFrame = window.requestAnimationFrame(() => {
+        resizeFrame = 0;
+        resizeTerminal();
+      });
+    };
+    const resizeObserver =
+      typeof ResizeObserver !== "undefined"
+        ? new ResizeObserver(() => {
+            queueResizeTerminal();
+          })
+        : null;
+
+    fitAddon.fit();
+    resizeObserver?.observe(terminalHost);
 
     const dataDisposable = terminal.onData((data) => {
       if (!hasConnectionRef.current) {
         return;
       }
-      const committedCommands = trackTerminalInput(data);
-      void invoke("send_terminal_input", { data })
+      const terminalId = activeTerminalIdRef.current;
+      const committedCommands = trackTerminalInput(data, terminalId);
+      void sendToActiveTerminal(data)
         .then(() => {
           committedCommands.forEach((command) => rememberCommand(command));
         })
         .catch((error) => {
           console.error(error);
+          const message = String(error);
+          if (consumeRuntimeDisconnect(message)) {
+            return;
+          }
+          setStatusLine(`终端输入发送失败: ${message}`);
         });
     });
 
@@ -1881,9 +2388,25 @@ function App() {
     let unlistenStatus: (() => void) | undefined;
 
     void listen<TerminalChunk>("terminal-chunk", (event) => {
-      terminal.write(event.payload.data);
-      syncDraftFromTerminalBuffer(terminal);
-      if (searchQueryRef.current.trim() && activeWorkspaceRef.current === "terminal") {
+      const promptArtifactCollapsed = appendTerminalOutput(event.payload.terminalId, event.payload.data);
+      if (hasPromptTail(terminalOutputsRef.current[event.payload.terminalId] ?? "")) {
+        clearScheduledTerminalPromptWake(event.payload.terminalId);
+      }
+      if (event.payload.terminalId === activeTerminalIdRef.current) {
+        if (promptArtifactCollapsed) {
+          syncVisibleTerminalFromActiveTab();
+        } else {
+          terminal.write(event.payload.data);
+          syncDraftFromTerminalBuffer(event.payload.terminalId, terminal);
+        }
+      } else {
+        setTerminalTabs((previous) =>
+          previous.map((item) =>
+            item.id === event.payload.terminalId ? { ...item, hasUnreadOutput: true } : item
+          )
+        );
+      }
+      if (event.payload.terminalId === activeTerminalIdRef.current && searchQueryRef.current.trim() && activeWorkspaceRef.current === "terminal") {
         setTerminalContentVersion((previous) => previous + 1);
       }
     }).then((fn) => {
@@ -1891,22 +2414,41 @@ function App() {
     });
 
     void listen<TerminalStatus>("terminal-status", (event) => {
-      setStatusLine(event.payload.message);
+      if (event.payload.kind === "connected" && event.payload.terminalId === activeTerminalIdRef.current) {
+        runtimeDisconnectHandledRef.current = false;
+      }
+      if ((event.payload.kind === "error" || event.payload.kind === "closed") && event.payload.connectionLost) {
+        handleRuntimeDisconnect(event.payload.message);
+        return;
+      }
       if (event.payload.kind === "closed") {
-        setConnection(null);
-        clearRemoteBrowserState();
+        const nextTabs = terminalTabsRef.current
+          .filter((item) => item.id !== event.payload.terminalId)
+          .map(({ id, title }) => ({ id, title }));
+        upsertTerminalTabs(nextTabs);
+        if (!nextTabs.length && hasConnectionRef.current) {
+          void loadTerminalTabs({ createIfEmpty: true });
+        }
+      }
+      if (event.payload.terminalId === activeTerminalIdRef.current) {
+        setStatusLine(event.payload.message);
       }
     }).then((fn) => {
       unlistenStatus = fn;
     });
 
-    window.addEventListener("resize", resizeTerminal);
+    window.addEventListener("resize", queueResizeTerminal);
     terminalRef.current = terminal;
     fitAddonRef.current = fitAddon;
+    syncVisibleTerminalFromActiveTab();
 
     return () => {
       dataDisposable.dispose();
-      window.removeEventListener("resize", resizeTerminal);
+      if (resizeFrame) {
+        window.cancelAnimationFrame(resizeFrame);
+      }
+      resizeObserver?.disconnect();
+      window.removeEventListener("resize", queueResizeTerminal);
       unlistenChunk?.();
       unlistenStatus?.();
       terminal.dispose();
@@ -1921,6 +2463,20 @@ function App() {
     terminalRef.current.options.theme = resolveTerminalTheme(appliedThemeMode);
   }, [appliedThemeMode]);
 
+  useEffect(() => {
+    if (!terminalRef.current) {
+      return;
+    }
+
+    syncVisibleTerminalFromActiveTab();
+    fitAddonRef.current?.fit();
+    if (connection && activeTerminalId) {
+      void resizeActiveTerminal(terminalRef.current.cols, terminalRef.current.rows).catch((error) => {
+        console.error(error);
+      });
+    }
+  }, [activeTerminalId, connection, appliedThemeMode]);
+
   async function bootstrap() {
     try {
       setAppVersion(await getVersion());
@@ -1929,15 +2485,14 @@ function App() {
     }
 
     const data = await invoke<ShellOverview>("get_shell_overview");
-    setOverview(data);
     setConnection(data.connection);
     if (data.connection?.homePath) {
+      runtimeDisconnectHandledRef.current = false;
+      const sessions = await loadTerminalTabs({ createIfEmpty: true });
       setCurrentPath("/");
       setIsConnectModalOpen(false);
       await loadDirectory("/", { expand: false });
-      window.setTimeout(() => {
-        void restoreTerminalPromptAfterReload();
-      }, 180);
+      scheduleInitialTerminalPromptWake(sessions, "已恢复 SSH 会话");
     } else {
       setIsConnectModalOpen(true);
     }
@@ -2158,7 +2713,9 @@ function App() {
       });
 
       setConnection(result);
+      runtimeDisconnectHandledRef.current = false;
       setForm(sourceForm);
+      resetTerminalTabState();
       clearRemoteBrowserState();
       currentInputBufferRef.current = "";
       setHasCommandDraft(false);
@@ -2190,17 +2747,14 @@ function App() {
             }
           : previous
       );
+      const sessions = await loadTerminalTabs({ createIfEmpty: true });
       await loadDirectory("/");
+      scheduleInitialTerminalPromptWake(sessions, `已连接 ${result.host}`);
       fitAddonRef.current?.fit();
       if (terminalRef.current) {
-        await invoke("resize_terminal", {
-          cols: terminalRef.current.cols,
-          rows: terminalRef.current.rows
-        });
+        await resizeActiveTerminal(terminalRef.current.cols, terminalRef.current.rows);
         terminalRef.current.focus();
       }
-      const refreshed = await invoke<ShellOverview>("get_shell_overview");
-      setOverview(refreshed);
     } catch (error) {
       console.error(error);
       const message = String(error);
@@ -2220,8 +2774,6 @@ function App() {
       if (trackedProfileId && connectionProfiles.some((item) => item.id === trackedProfileId)) {
         markConnectionProfileResult(trackedProfileId, "error", message);
       }
-      const refreshed = await invoke<ShellOverview>("get_shell_overview");
-      setOverview(refreshed);
     } finally {
       setIsConnecting(false);
     }
@@ -2235,18 +2787,24 @@ function App() {
   }
 
   async function disconnect() {
-    await invoke("disconnect_ssh");
+    runtimeDisconnectHandledRef.current = true;
+    try {
+      await invoke("disconnect_ssh");
+    } catch (error) {
+      console.error(error);
+    }
     setConnection(null);
     setConnectionProgress(null);
+    setConnectError("");
+    resetTerminalTabState();
     clearRemoteBrowserState();
     currentInputBufferRef.current = "";
+    pendingTerminalDraftSyncRef.current = false;
     setHasCommandDraft(false);
     setHistorySelection("");
     setIsHistoryMenuOpen(false);
     setStatusLine("SSH 会话已关闭");
     terminalRef.current?.writeln("\r\n[session closed]\r\n");
-    const refreshed = await invoke<ShellOverview>("get_shell_overview");
-    setOverview(refreshed);
   }
 
   async function loadDirectory(path: string, options?: { expand?: boolean }) {
@@ -2271,7 +2829,11 @@ function App() {
       setStatusLine(`目录已加载: ${path}`);
     } catch (error) {
       console.error(error);
-      setStatusLine(String(error));
+      const message = String(error);
+      if (consumeRuntimeDisconnect(message)) {
+        return;
+      }
+      setStatusLine(message);
     } finally {
       setLoadingPaths((previous) => {
         if (!previous[path]) {
@@ -2342,13 +2904,15 @@ function App() {
       setEditorContent(file.content ?? "");
       setActiveWorkspace("preview");
       setStatusLine(`已预览: ${path}`);
-      const refreshed = await invoke<ShellOverview>("get_shell_overview");
-      setOverview(refreshed);
     } catch (error) {
       console.error(error);
+      const message = String(error);
+      if (consumeRuntimeDisconnect(message)) {
+        return;
+      }
       setPreview(null);
-      setPreviewError(`无法预览 ${path}: ${String(error)}`);
-      setStatusLine(String(error));
+      setPreviewError(`无法预览 ${path}: ${message}`);
+      setStatusLine(message);
     }
   }
 
@@ -2358,33 +2922,10 @@ function App() {
     }
   }
 
-  async function restoreTerminalPromptAfterReload() {
-    if (!hasConnectionRef.current) {
-      return;
-    }
-
-    try {
-      pendingTerminalDraftSyncRef.current = true;
-      await invoke("send_terminal_input", { data: "\n" });
-      setStatusLine("已恢复 SSH 会话，正在尝试唤起远端命令行提示符...");
-    } catch (error) {
-      console.error(error);
-      setStatusLine("已恢复 SSH 会话，但终端提示符还没出来，可手动按一次回车。");
-      terminalRef.current?.writeln("\r\n[hint] 会话已恢复，如终端没有提示符，请按一次回车。\r\n");
-    }
-  }
-
   function rememberCommand(command: string) {
     const cwd = currentPath || connection?.homePath || "/";
     setCommandHistory((previous) => pushCommandHistory(previous, command, cwd));
     setHistorySelection(command.trim());
-  }
-
-  function syncCommandDraft(next: string) {
-    currentInputBufferRef.current = next;
-    const nextHasCommandDraft = next.trim().length > 0;
-    setHasCommandDraft((previous) => (previous === nextHasCommandDraft ? previous : nextHasCommandDraft));
-    setHistorySelection((previous) => (next.trim() !== previous ? "" : previous));
   }
 
   function clearRemoteBrowserState() {
@@ -2400,14 +2941,17 @@ function App() {
     setDragTargetPath("");
   }
 
-  function trackTerminalInput(data: string): string[] {
+  function trackTerminalInput(data: string, terminalId = activeTerminalIdRef.current): string[] {
     const committedCommands: string[] = [];
+    if (!terminalId) {
+      return committedCommands;
+    }
     if (data.includes("\u001b")) {
       pendingTerminalDraftSyncRef.current = true;
       return committedCommands;
     }
 
-    let next = currentInputBufferRef.current;
+    let next = terminalInputBuffersRef.current[terminalId] ?? "";
 
     for (const char of data) {
       if (char === "\r") {
@@ -2438,11 +2982,11 @@ function App() {
       }
     }
 
-    syncCommandDraft(next);
+    syncCommandDraft(next, terminalId);
     return committedCommands;
   }
 
-  function syncDraftFromTerminalBuffer(terminal: Terminal | null) {
+  function syncDraftFromTerminalBuffer(terminalId: string, terminal: Terminal | null) {
     if (!terminal) {
       return;
     }
@@ -2461,7 +3005,7 @@ function App() {
       return;
     }
 
-    syncCommandDraft(parsed);
+    syncCommandDraft(parsed, terminalId);
     pendingTerminalDraftSyncRef.current = false;
   }
 
@@ -2532,9 +3076,7 @@ function App() {
     }
 
     try {
-      await invoke("send_terminal_input", {
-        data: `\u0015${normalized}`
-      });
+      await sendToActiveTerminal(`\u0015${normalized}`);
       setHistorySelection(normalized);
       syncCommandDraft(normalized);
       setStatusLine(`已填入命令行: ${normalized}`);
@@ -2542,7 +3084,11 @@ function App() {
       terminalRef.current?.focus();
     } catch (error) {
       console.error(error);
-      setStatusLine(`命令发送失败: ${String(error)}`);
+      const message = String(error);
+      if (consumeRuntimeDisconnect(message)) {
+        return;
+      }
+      setStatusLine(`命令发送失败: ${message}`);
     }
   }
 
@@ -2559,14 +3105,18 @@ function App() {
     }
 
     try {
-      await invoke("send_terminal_input", { data: "\r" });
+      await sendToActiveTerminal("\r");
       rememberCommand(currentLine);
       syncCommandDraft("");
       setStatusLine(`已执行命令: ${currentLine}`);
       terminalRef.current?.focus();
     } catch (error) {
       console.error(error);
-      setStatusLine(`执行失败: ${String(error)}`);
+      const message = String(error);
+      if (consumeRuntimeDisconnect(message)) {
+        return;
+      }
+      setStatusLine(`执行失败: ${message}`);
     }
   }
 
@@ -2577,14 +3127,18 @@ function App() {
     }
 
     try {
-      await invoke("send_terminal_input", { data: "\u0015" });
+      await sendToActiveTerminal("\u0015");
       syncCommandDraft("");
       setHistorySelection("");
       setStatusLine("当前命令行已清空");
       terminalRef.current?.focus();
     } catch (error) {
       console.error(error);
-      setStatusLine(`清空当前行失败: ${String(error)}`);
+      const message = String(error);
+      if (consumeRuntimeDisconnect(message)) {
+        return;
+      }
+      setStatusLine(`清空当前行失败: ${message}`);
     }
   }
 
@@ -2596,13 +3150,17 @@ function App() {
 
     try {
       pendingTerminalDraftSyncRef.current = true;
-      await invoke("send_terminal_input", { data: "\t" });
+      await sendToActiveTerminal("\t");
       setStatusLine("已触发 Tab 补全");
       terminalRef.current?.focus();
     } catch (error) {
       pendingTerminalDraftSyncRef.current = false;
       console.error(error);
-      setStatusLine(`Tab 补全失败: ${String(error)}`);
+      const message = String(error);
+      if (consumeRuntimeDisconnect(message)) {
+        return;
+      }
+      setStatusLine(`Tab 补全失败: ${message}`);
     }
   }
 
@@ -2613,10 +3171,13 @@ function App() {
     }
 
     terminalRef.current?.clear();
+    if (activeTerminalIdRef.current) {
+      terminalOutputsRef.current[activeTerminalIdRef.current] = "";
+    }
     syncCommandDraft("");
 
     try {
-      await invoke("send_terminal_input", { data: "clear\r" });
+      await sendToActiveTerminal("clear\r");
       setStatusLine("终端已清屏");
       if (searchQueryRef.current.trim() && activeWorkspaceRef.current === "terminal") {
         setTerminalContentVersion((previous) => previous + 1);
@@ -2624,7 +3185,11 @@ function App() {
       terminalRef.current?.focus();
     } catch (error) {
       console.error(error);
-      setStatusLine(`清屏失败: ${String(error)}`);
+      const message = String(error);
+      if (consumeRuntimeDisconnect(message)) {
+        return;
+      }
+      setStatusLine(`清屏失败: ${message}`);
     }
   }
 
@@ -2933,11 +3498,12 @@ function App() {
           second: "2-digit"
         })}`
       });
-      const refreshed = await invoke<ShellOverview>("get_shell_overview");
-      setOverview(refreshed);
     } catch (error) {
       console.error(error);
       const message = String(error);
+      if (consumeRuntimeDisconnect(message)) {
+        return;
+      }
       setStatusLine(message);
       setSaveFeedback({
         tone: "error",
@@ -2984,13 +3550,14 @@ function App() {
       await loadDirectory(targetDir);
       if (firstImagePath) {
         await openPreview(firstImagePath);
-      } else {
-        const refreshed = await invoke<ShellOverview>("get_shell_overview");
-        setOverview(refreshed);
       }
     } catch (error) {
       console.error(error);
-      setStatusLine(`上传失败: ${String(error)}`);
+      const message = String(error);
+      if (consumeRuntimeDisconnect(message)) {
+        return;
+      }
+      setStatusLine(`上传失败: ${message}`);
     } finally {
       setIsUploading(false);
       setDragTargetPath("");
@@ -3022,7 +3589,7 @@ function App() {
       if (options?.fillTerminalPaths) {
         const pastedPaths = results.map((item) => shellEscapePath(item.path)).join(" ");
         if (pastedPaths) {
-          await invoke("send_terminal_input", { data: pastedPaths });
+          await sendToActiveTerminal(pastedPaths);
           trackTerminalInput(pastedPaths).forEach((command) => rememberCommand(command));
           setActiveWorkspace("terminal");
           terminalRef.current?.focus();
@@ -3035,13 +3602,14 @@ function App() {
 
       if (firstImagePath) {
         await openPreview(firstImagePath);
-      } else {
-        const refreshed = await invoke<ShellOverview>("get_shell_overview");
-        setOverview(refreshed);
       }
     } catch (error) {
       console.error(error);
-      setStatusLine(`剪贴板上传失败: ${String(error)}`);
+      const message = String(error);
+      if (consumeRuntimeDisconnect(message)) {
+        return;
+      }
+      setStatusLine(`剪贴板上传失败: ${message}`);
     } finally {
       setIsUploading(false);
       setDragTargetPath("");
@@ -3060,14 +3628,18 @@ function App() {
     }
 
     try {
-      await invoke("send_terminal_input", { data: text });
+      await sendToActiveTerminal(text);
       trackTerminalInput(text).forEach((command) => rememberCommand(command));
       setActiveWorkspace("terminal");
       setStatusLine("已粘贴剪贴板内容到终端");
       terminalRef.current?.focus();
     } catch (error) {
       console.error(error);
-      setStatusLine(`终端粘贴失败: ${String(error)}`);
+      const message = String(error);
+      if (consumeRuntimeDisconnect(message)) {
+        return;
+      }
+      setStatusLine(`终端粘贴失败: ${message}`);
     }
   }
 
@@ -3249,6 +3821,9 @@ function App() {
     } catch (error) {
       console.error(error);
       const message = String(error);
+      if (consumeRuntimeDisconnect(message)) {
+        return;
+      }
       setFileActionDialog((previous) =>
         previous
           ? {
@@ -3316,9 +3891,7 @@ function App() {
     }
 
     try {
-      await invoke("send_terminal_input", {
-        data: buildCdCommand(targetDir)
-      });
+      await sendToActiveTerminal(buildCdCommand(targetDir));
       syncCommandDraft("");
       setActiveWorkspace("terminal");
       setStatusLine(`已发送切换目录命令: ${targetDir}`);
@@ -3326,7 +3899,11 @@ function App() {
       terminalRef.current?.focus();
     } catch (error) {
       console.error(error);
-      setStatusLine(`终端切换目录失败: ${String(error)}`);
+      const message = String(error);
+      if (consumeRuntimeDisconnect(message)) {
+        return;
+      }
+      setStatusLine(`终端切换目录失败: ${message}`);
     }
   }
 
@@ -3355,7 +3932,11 @@ function App() {
       setStatusLine(result.message);
     } catch (error) {
       console.error(error);
-      setStatusLine(`下载失败: ${String(error)}`);
+      const message = String(error);
+      if (consumeRuntimeDisconnect(message)) {
+        return;
+      }
+      setStatusLine(`下载失败: ${message}`);
     }
   }
 
@@ -3458,21 +4039,30 @@ function App() {
   );
 
   const connectionHostText = connection?.host ?? "未连接";
+  const activeTerminalTab = terminalTabs.find((item) => item.id === activeTerminalId) ?? null;
+  const terminalShellTitle = activeTerminalTab?.title ?? "终端";
+  const terminalShellSubtitle = connection ? `${connection.name} · ${statusLine}` : statusLine;
   const currentWorkspaceTitle =
     activeWorkspace === "terminal"
       ? connection
-        ? `${connection.name} 终端`
+        ? `${connection.name} · ${activeTerminalTab?.title ?? "终端"}`
         : "终端未连接"
       : preview?.path ?? (previewError ? "预览失败" : "还没选择文件");
   const currentWorkspaceSubtitle =
     activeWorkspace === "terminal"
-      ? statusLine
+      ? activeTerminalTab
+        ? `${activeTerminalTab.title} · ${statusLine}`
+        : statusLine
       : preview
         ? `${preview.kind} · ${formatBytes(preview.size)}${preview.truncated ? ` · 已截断到 ${formatBytes(preview.previewBytes)}` : ""}`
         : previewError || "点文件树里的文件就会在这里预览";
   const selectionPath = selectedEntry?.path ?? preview?.path ?? currentPath ?? "/";
   const basicLatencyLabel = connection ? `${connection.latencyMs}ms` : "--";
-  const terminalStatusLabel = connection ? "终端在线" : "终端离线";
+  const terminalStatusLabel = connection
+    ? terminalTabs.length
+      ? `终端 ${terminalTabs.length} 窗口`
+      : "终端待启动"
+    : "终端离线";
   const updateButtonLabel = updateInfo?.available && updateInfo.version ? `有新版本 ${updateInfo.version}` : "关于 / 更新";
   const updateButtonTitle = updateInfo?.available
     ? [updateInfo.message, updateInfo.notes].filter(Boolean).join("\n\n")
@@ -3871,6 +4461,7 @@ function App() {
                 connectionHostText={connectionHostText}
                 basicLatencyLabel={basicLatencyLabel}
                 pollIntervalMs={SYSTEM_SNAPSHOT_POLL_INTERVAL_MS}
+                onConnectionIssue={handleRuntimeDisconnect}
               >
                 {({ detailButton, metricsPanel }) => (
                   <>
@@ -4013,29 +4604,170 @@ function App() {
               </div>
             </div>
 
-            <div className="workspace-meta-bar">
-              <div>
-                <strong>{currentWorkspaceTitle}</strong>
-                <span>{currentWorkspaceSubtitle}</span>
+            {activeWorkspace === "preview" ? (
+              <div className="workspace-meta-bar">
+                <div>
+                  <strong>{currentWorkspaceTitle}</strong>
+                  <span>{currentWorkspaceSubtitle}</span>
+                </div>
+                <div className="workspace-meta-side">
+                  <span>
+                    {`${preview?.language ?? preview?.kind ?? "无预览"} · ${selectedEntry ? formatPermissions(selectedEntry.permissions) : "--"}${preview?.readonly ? " · 权限提示" : ""}`}
+                  </span>
+                  <span>{`${selectionPath} · ${selectedEntry ? formatModifiedAt(selectedEntry.modifiedAt) : "等待选择"}`}</span>
+                </div>
               </div>
-              <div className="workspace-meta-side">
-                <span>
-                  {activeWorkspace === "preview"
-                    ? `${preview?.language ?? preview?.kind ?? "无预览"} · ${selectedEntry ? formatPermissions(selectedEntry.permissions) : "--"}${preview?.readonly ? " · 权限提示" : ""}`
-                    : "SSH 终端"}
-                </span>
-                <span>
-                  {activeWorkspace === "preview"
-                    ? `${selectionPath} · ${selectedEntry ? formatModifiedAt(selectedEntry.modifiedAt) : "等待选择"}`
-                    : connection?.homePath ?? "/"}
-                </span>
-              </div>
-            </div>
+            ) : null}
 
             <div className="workspace-body">
               <div className={`workspace-pane ${activeWorkspace === "terminal" ? "active" : ""}`}>
-                <div className="terminal-surface workspace-terminal" onMouseDown={focusTerminal}>
+                <div className="terminal-surface workspace-terminal terminal-shell" onMouseDown={focusTerminal}>
+                  <div className="terminal-shell-header">
+                    <div className="terminal-session-strip">
+                      <button
+                        className="terminal-session-nav"
+                        disabled={!terminalTabsOverflow.canScrollLeft}
+                        onClick={() => scrollTerminalTabs("left")}
+                        aria-label="向左查看终端标签"
+                        title="向左查看终端标签"
+                      >
+                        ‹
+                      </button>
+                      <div className="terminal-session-tabs" ref={terminalTabsScrollerRef}>
+                        {terminalTabs.map((tab) => (
+                          <button
+                            key={tab.id}
+                            ref={(node) => {
+                              terminalTabButtonRefs.current[tab.id] = node;
+                            }}
+                            className={`terminal-session-tab ${tab.id === activeTerminalId ? "active" : ""} ${
+                              tab.hasUnreadOutput && tab.id !== activeTerminalId ? "has-unread" : ""
+                            }`}
+                            onClick={() => {
+                              setActiveTerminalId(tab.id);
+                              setTerminalTabs((previous) =>
+                                previous.map((item) =>
+                                  item.id === tab.id ? { ...item, hasUnreadOutput: false } : item
+                                )
+                              );
+                              setActiveWorkspace("terminal");
+                            }}
+                          >
+                            <span className="terminal-session-label">{tab.title}</span>
+                            {terminalTabs.length > 1 ? (
+                              <span
+                                className="terminal-session-close"
+                                role="button"
+                                tabIndex={0}
+                                aria-label={`关闭${tab.title}`}
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  void closeTerminalTab(tab.id);
+                                }}
+                                onKeyDown={(event) => {
+                                  if (event.key === "Enter" || event.key === " ") {
+                                    event.preventDefault();
+                                    event.stopPropagation();
+                                    void closeTerminalTab(tab.id);
+                                  }
+                                }}
+                              >
+                                ×
+                              </span>
+                            ) : null}
+                          </button>
+                        ))}
+                      </div>
+                      <div className="terminal-session-actions">
+                        <button
+                          className="terminal-session-create"
+                          disabled={!connection}
+                          onClick={() => void createTerminalTab()}
+                        >
+                          <span>+</span>
+                          <span>新建终端</span>
+                        </button>
+                        <button
+                          className="terminal-session-nav"
+                          disabled={!terminalTabsOverflow.canScrollRight}
+                          onClick={() => scrollTerminalTabs("right")}
+                          aria-label="向右查看终端标签"
+                          title="向右查看终端标签"
+                        >
+                          ›
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                  <div className="terminal-shell-toolbar">
+                    <div className="terminal-shell-copy">
+                      <strong>{terminalShellTitle}</strong>
+                      <span>{terminalShellSubtitle}</span>
+                    </div>
+                    <div className="terminal-shell-side">
+                      <span className="terminal-shell-meta-pill">{terminalStatusLabel}</span>
+                      <span className="terminal-shell-meta-path">{connection?.homePath ?? "/"}</span>
+                    </div>
+                  </div>
                   <div className="terminal-host" ref={terminalHostRef} />
+                  <div className="terminal-shell-footer">
+                    <TerminalToolbar
+                      historyMenuRef={historyMenuRef}
+                      searchInputRef={searchInputRef}
+                      isHistoryMenuOpen={isHistoryMenuOpen}
+                      commandHistory={commandHistory}
+                      scopedCommandHistory={scopedCommandHistory}
+                      favoriteCommandHistory={favoriteCommandHistory}
+                      historySelection={historySelection}
+                      historyTriggerSummary={historyTriggerSummary}
+                      currentDirectoryPath={currentDirectoryPath}
+                      hasCommandDraft={hasCommandDraft}
+                      searchQuery={searchQuery}
+                      searchResultCount={searchResultCount}
+                      searchCounterLabel={searchCounterLabel}
+                      statusLine={statusLine}
+                      hasConnection={Boolean(connection && activeTerminalId)}
+                      onToggleHistoryMenu={() => setIsHistoryMenuOpen((previous) => !previous)}
+                      onUseHistoryCommand={(command) => {
+                        setIsHistoryMenuOpen(false);
+                        void fillTerminalCommand(command);
+                      }}
+                      onCopyCommand={(command) => {
+                        void copyTextToClipboard(command, "命令");
+                      }}
+                      onToggleFavorite={(command, cwd) => {
+                        setCommandHistory((previous) => toggleCommandFavorite(previous, command, cwd));
+                      }}
+                      onClearCurrentCommand={() => {
+                        void clearCurrentCommand();
+                      }}
+                      onRequestTabCompletion={() => {
+                        void requestTabCompletion();
+                      }}
+                      onExecuteTerminalCommand={() => {
+                        void executeTerminalCommand();
+                      }}
+                      onSearchQueryChange={setSearchQuery}
+                      onSearchKeyDown={(event) => {
+                        if (event.key === "Enter") {
+                          event.preventDefault();
+                          jumpSearch(event.shiftKey ? -1 : 1);
+                          return;
+                        }
+
+                        if (event.key === "Escape") {
+                          event.preventDefault();
+                          clearSearch();
+                        }
+                      }}
+                      onJumpSearch={jumpSearch}
+                      onClearSearch={clearSearch}
+                      onClearTerminal={() => {
+                        void clearTerminal();
+                      }}
+                      formatHistoryTime={formatUpdateCheckTime}
+                    />
+                  </div>
                 </div>
               </div>
 
@@ -4059,65 +4791,6 @@ function App() {
                 />
               </div>
             </div>
-
-            {activeWorkspace === "terminal" ? (
-              <TerminalToolbar
-                historyMenuRef={historyMenuRef}
-                searchInputRef={searchInputRef}
-                isHistoryMenuOpen={isHistoryMenuOpen}
-                commandHistory={commandHistory}
-                scopedCommandHistory={scopedCommandHistory}
-                favoriteCommandHistory={favoriteCommandHistory}
-                historySelection={historySelection}
-                historyTriggerSummary={historyTriggerSummary}
-                currentDirectoryPath={currentDirectoryPath}
-                hasCommandDraft={hasCommandDraft}
-                searchQuery={searchQuery}
-                searchResultCount={searchResultCount}
-                searchCounterLabel={searchCounterLabel}
-                statusLine={statusLine}
-                hasConnection={Boolean(connection)}
-                onToggleHistoryMenu={() => setIsHistoryMenuOpen((previous) => !previous)}
-                onUseHistoryCommand={(command) => {
-                  setIsHistoryMenuOpen(false);
-                  void fillTerminalCommand(command);
-                }}
-                onCopyCommand={(command) => {
-                  void copyTextToClipboard(command, "命令");
-                }}
-                onToggleFavorite={(command, cwd) => {
-                  setCommandHistory((previous) => toggleCommandFavorite(previous, command, cwd));
-                }}
-                onClearCurrentCommand={() => {
-                  void clearCurrentCommand();
-                }}
-                onRequestTabCompletion={() => {
-                  void requestTabCompletion();
-                }}
-                onExecuteTerminalCommand={() => {
-                  void executeTerminalCommand();
-                }}
-                onSearchQueryChange={setSearchQuery}
-                onSearchKeyDown={(event) => {
-                  if (event.key === "Enter") {
-                    event.preventDefault();
-                    jumpSearch(event.shiftKey ? -1 : 1);
-                    return;
-                  }
-
-                  if (event.key === "Escape") {
-                    event.preventDefault();
-                    clearSearch();
-                  }
-                }}
-                onJumpSearch={jumpSearch}
-                onClearSearch={clearSearch}
-                onClearTerminal={() => {
-                  void clearTerminal();
-                }}
-                formatHistoryTime={formatUpdateCheckTime}
-              />
-            ) : null}
           </section>
         </main>
       </div>

@@ -134,12 +134,20 @@ export interface AppUpdateProgress {
 }
 
 export interface TerminalChunk {
+  terminalId: string;
   data: string;
 }
 
 export interface TerminalStatus {
+  terminalId: string;
   kind: string;
   message: string;
+  connectionLost: boolean;
+}
+
+export interface TerminalSessionSummary {
+  id: string;
+  title: string;
 }
 
 export interface ConnectionProgress {

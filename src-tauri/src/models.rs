@@ -168,14 +168,24 @@ pub struct AppUpdateProgress {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalChunk {
+    pub terminal_id: String,
     pub data: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalStatus {
+    pub terminal_id: String,
     pub kind: String,
     pub message: String,
+    pub connection_lost: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalSessionSummary {
+    pub id: String,
+    pub title: String,
 }
 
 #[derive(Debug, Clone, Serialize)]

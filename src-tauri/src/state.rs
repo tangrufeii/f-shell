@@ -1,4 +1,7 @@
-use std::sync::{mpsc::Sender, Mutex};
+use std::{
+    collections::HashMap,
+    sync::{mpsc::Sender, Mutex},
+};
 
 use ssh2::Session;
 
@@ -32,7 +35,7 @@ pub struct TerminalHandle {
 pub struct AppState {
     pub connection: Mutex<Option<StoredConnection>>,
     pub file_session: Mutex<Option<Session>>,
-    pub terminal: Mutex<Option<TerminalHandle>>,
+    pub terminals: Mutex<HashMap<String, TerminalHandle>>,
     pub current_path: Mutex<Option<String>>,
     pub recent_files: Mutex<Vec<String>>,
 }

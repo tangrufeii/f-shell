@@ -1,6 +1,5 @@
 use std::{
-    env,
-    fs,
+    env, fs,
     io::{ErrorKind, Read, Write},
     net::{TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
@@ -20,9 +19,11 @@ use url::Url;
 
 use crate::{
     models::{
-        AppUpdateFeedInfo, AppUpdateInfo, AppUpdateInstallResponse, AppUpdateProgress, ConnectRequest,
-        ConnectionProgress, ConnectionSummary, DownloadResponse, FileActionResponse, FilePreview,
-        RemoteEntry, RemoteProcessStat, RemoteSystemSnapshot, SaveResponse, ShellOverview, TerminalChunk, TerminalStatus, UploadResponse,
+        AppUpdateFeedInfo, AppUpdateInfo, AppUpdateInstallResponse, AppUpdateProgress,
+        ConnectRequest, ConnectionProgress, ConnectionSummary, DownloadResponse,
+        FileActionResponse, FilePreview, RemoteEntry, RemoteProcessStat, RemoteSystemSnapshot,
+        SaveResponse, ShellOverview, TerminalChunk, TerminalSessionSummary, TerminalStatus,
+        UploadResponse,
     },
     state::{AppState, StoredConnection, TerminalCommand, TerminalHandle},
 };
@@ -32,7 +33,7 @@ const IMAGE_PREVIEW_LIMIT: u64 = 12 * 1024 * 1024;
 const SSH_CONNECT_TIMEOUT: Duration = Duration::from_secs(6);
 const SSH_IO_TIMEOUT: Duration = Duration::from_secs(12);
 const CONNECT_TOTAL_STEPS: u8 = 5;
-const SSH_KEEPALIVE_INTERVAL_SECS: u32 = 15;
+const SSH_KEEPALIVE_INTERVAL_SECS: u32 = 5;
 const SHELL_PROMPT_WAKE_DELAY: Duration = Duration::from_millis(420);
 const SHELL_PROMPT_HINT_DELAY: Duration = Duration::from_millis(1400);
 const LEGACY_KEX_PREFS: &str =
@@ -269,7 +270,10 @@ pub async fn install_app_update(app: AppHandle) -> Result<AppUpdateInstallRespon
 
 #[tauri::command]
 pub fn get_shell_overview(state: State<'_, AppState>) -> Result<ShellOverview, String> {
-    let connection = state.connection.lock().map_err(|_| "连接状态锁坏了".to_string())?;
+    let connection = state
+        .connection
+        .lock()
+        .map_err(|_| "连接状态锁坏了".to_string())?;
     let current_path = state
         .current_path
         .lock()
@@ -314,7 +318,10 @@ pub async fn get_remote_system_snapshot(
 }
 
 #[tauri::command]
-pub async fn connect_ssh(app: AppHandle, request: ConnectRequest) -> Result<ConnectionSummary, String> {
+pub async fn connect_ssh(
+    app: AppHandle,
+    request: ConnectRequest,
+) -> Result<ConnectionSummary, String> {
     let blocking_app = app.clone();
     tauri::async_runtime::spawn_blocking(move || connect_ssh_blocking(blocking_app, request))
         .await
@@ -327,7 +334,10 @@ pub fn disconnect_ssh(state: State<'_, AppState>) -> Result<(), String> {
     Ok(())
 }
 
-fn connect_ssh_blocking(app: AppHandle, request: ConnectRequest) -> Result<ConnectionSummary, String> {
+fn connect_ssh_blocking(
+    app: AppHandle,
+    request: ConnectRequest,
+) -> Result<ConnectionSummary, String> {
     let state = app.state::<AppState>();
     clear_connection_state(&state)?;
     let result: Result<ConnectionSummary, String> = (|| {
@@ -386,32 +396,6 @@ fn connect_ssh_blocking(app: AppHandle, request: ConnectRequest) -> Result<Conne
             home_path: home_path.clone(),
         };
 
-        emit_connection_progress(
-            &app,
-            ConnectionProgress {
-                stage: "terminal".into(),
-                message: "正在启动交互终端...".into(),
-                detail: Some("PTY 建好后就能开始收发命令。".into()),
-                current_step: 5,
-                total_steps: CONNECT_TOTAL_STEPS,
-                is_error: false,
-            },
-        );
-
-        let mut channel = session.channel_session().map_err(to_error)?;
-        channel
-            .request_pty(
-                "xterm-256color",
-                None,
-                Some((u32::from(request.cols), u32::from(request.rows), 0, 0)),
-            )
-            .map_err(to_error)?;
-        channel.shell().map_err(to_error)?;
-        session.set_blocking(false);
-
-        let (tx, rx) = mpsc::channel::<TerminalCommand>();
-        spawn_terminal_worker(app.clone(), session, channel, rx);
-
         let stored = StoredConnection {
             host: request.host.clone(),
             port: request.port,
@@ -429,10 +413,6 @@ fn connect_ssh_blocking(app: AppHandle, request: ConnectRequest) -> Result<Conne
             .lock()
             .map_err(|_| "文件会话状态锁坏了".to_string())? = Some(file_session);
         *state
-            .terminal
-            .lock()
-            .map_err(|_| "终端状态锁坏了".to_string())? = Some(TerminalHandle { sender: tx });
-        *state
             .current_path
             .lock()
             .map_err(|_| "路径状态锁坏了".to_string())? = Some(home_path);
@@ -440,6 +420,19 @@ fn connect_ssh_blocking(app: AppHandle, request: ConnectRequest) -> Result<Conne
             .recent_files
             .lock()
             .map_err(|_| "最近文件状态锁坏了".to_string())? = Vec::new();
+
+        emit_connection_progress(
+            &app,
+            ConnectionProgress {
+                stage: "terminal".into(),
+                message: "正在启动交互终端...".into(),
+                detail: Some("PTY 建好后就能开始收发命令。".into()),
+                current_step: 5,
+                total_steps: CONNECT_TOTAL_STEPS,
+                is_error: false,
+            },
+        );
+        register_terminal_session(&app, session, request.cols, request.rows)?;
 
         emit_connection_progress(
             &app,
@@ -476,13 +469,62 @@ fn connect_ssh_blocking(app: AppHandle, request: ConnectRequest) -> Result<Conne
     result
 }
 
-fn clear_connection_state(state: &State<'_, AppState>) -> Result<(), String> {
-    if let Some(handle) = state
-        .terminal
+fn next_terminal_id() -> String {
+    format!(
+        "term-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|value| value.as_micros())
+            .unwrap_or_default()
+    )
+}
+
+fn remove_terminal_handle(app: &AppHandle, terminal_id: &str) -> Result<(), String> {
+    app.state::<AppState>()
+        .terminals
         .lock()
         .map_err(|_| "终端状态锁坏了".to_string())?
-        .take()
-    {
+        .remove(terminal_id);
+    Ok(())
+}
+
+fn register_terminal_session(
+    app: &AppHandle,
+    session: Session,
+    cols: u16,
+    rows: u16,
+) -> Result<String, String> {
+    let mut channel = session.channel_session().map_err(to_error)?;
+    channel
+        .request_pty(
+            "xterm-256color",
+            None,
+            Some((u32::from(cols), u32::from(rows), 0, 0)),
+        )
+        .map_err(to_error)?;
+    channel.shell().map_err(to_error)?;
+    session.set_blocking(false);
+
+    let terminal_id = next_terminal_id();
+    let (tx, rx) = mpsc::channel::<TerminalCommand>();
+    app.state::<AppState>()
+        .terminals
+        .lock()
+        .map_err(|_| "终端状态锁坏了".to_string())?
+        .insert(terminal_id.clone(), TerminalHandle { sender: tx });
+    spawn_terminal_worker(app.clone(), terminal_id.clone(), session, channel, rx);
+    Ok(terminal_id)
+}
+
+fn clear_connection_state(state: &State<'_, AppState>) -> Result<(), String> {
+    let terminal_handles = state
+        .terminals
+        .lock()
+        .map_err(|_| "终端状态锁坏了".to_string())?
+        .drain()
+        .map(|(_, handle)| handle)
+        .collect::<Vec<_>>();
+    for handle in terminal_handles {
         let _ = handle.sender.send(TerminalCommand::Close);
     }
 
@@ -500,14 +542,15 @@ fn clear_connection_state(state: &State<'_, AppState>) -> Result<(), String> {
 
 fn clear_runtime_connection_state(app: &AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
+    state
+        .terminals
+        .lock()
+        .map_err(|_| "终端状态锁坏了".to_string())?
+        .clear();
     *state
         .file_session
         .lock()
         .map_err(|_| "文件会话状态锁坏了".to_string())? = None;
-    *state
-        .terminal
-        .lock()
-        .map_err(|_| "终端状态锁坏了".to_string())? = None;
     *lock_connection(&state)? = None;
     *state
         .current_path
@@ -517,15 +560,72 @@ fn clear_runtime_connection_state(app: &AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn send_terminal_input(state: State<'_, AppState>, data: String) -> Result<(), String> {
-    let terminal = state
-        .terminal
+pub fn list_terminal_sessions(state: State<'_, AppState>) -> Result<Vec<TerminalSessionSummary>, String> {
+    let ids = state
+        .terminals
+        .lock()
+        .map_err(|_| "终端状态锁坏了".to_string())?;
+    let mut terminal_ids = ids.keys().cloned().collect::<Vec<_>>();
+    terminal_ids.sort();
+    Ok(terminal_ids
+        .into_iter()
+        .enumerate()
+        .map(|(index, id)| TerminalSessionSummary {
+            id,
+            title: format!("终端 {}", index + 1),
+        })
+        .collect())
+}
+
+#[tauri::command]
+pub fn create_terminal_session(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    cols: u16,
+    rows: u16,
+) -> Result<TerminalSessionSummary, String> {
+    let connection = active_connection(&state)?;
+    let session = connect_from_stored(&connection)?;
+    let terminal_id = register_terminal_session(&app, session, cols, rows)?;
+    let terminal_count = state
+        .terminals
+        .lock()
+        .map_err(|_| "终端状态锁坏了".to_string())?
+        .len();
+    Ok(TerminalSessionSummary {
+        id: terminal_id,
+        title: format!("终端 {}", terminal_count),
+    })
+}
+
+#[tauri::command]
+pub fn close_terminal_session(state: State<'_, AppState>, terminal_id: String) -> Result<(), String> {
+    let handle = state
+        .terminals
+        .lock()
+        .map_err(|_| "终端状态锁坏了".to_string())?
+        .remove(&terminal_id)
+        .ok_or_else(|| "终端窗口不存在或已经关闭。".to_string())?;
+    handle
+        .sender
+        .send(TerminalCommand::Close)
+        .map_err(|_| "终端会话已经断了。".to_string())
+}
+
+#[tauri::command]
+pub fn send_terminal_input(
+    state: State<'_, AppState>,
+    terminal_id: String,
+    data: String,
+) -> Result<(), String> {
+    let terminals = state
+        .terminals
         .lock()
         .map_err(|_| "终端状态锁坏了".to_string())?;
 
-    let handle = terminal
-        .as_ref()
-        .ok_or_else(|| "当前没有活动 SSH 会话。".to_string())?;
+    let handle = terminals
+        .get(&terminal_id)
+        .ok_or_else(|| "当前终端窗口不存在或已经关闭。".to_string())?;
 
     handle
         .sender
@@ -534,15 +634,20 @@ pub fn send_terminal_input(state: State<'_, AppState>, data: String) -> Result<(
 }
 
 #[tauri::command]
-pub fn resize_terminal(state: State<'_, AppState>, cols: u16, rows: u16) -> Result<(), String> {
-    let terminal = state
-        .terminal
+pub fn resize_terminal(
+    state: State<'_, AppState>,
+    terminal_id: String,
+    cols: u16,
+    rows: u16,
+) -> Result<(), String> {
+    let terminals = state
+        .terminals
         .lock()
         .map_err(|_| "终端状态锁坏了".to_string())?;
 
-    let handle = terminal
-        .as_ref()
-        .ok_or_else(|| "当前没有活动 SSH 会话。".to_string())?;
+    let handle = terminals
+        .get(&terminal_id)
+        .ok_or_else(|| "当前终端窗口不存在或已经关闭。".to_string())?;
 
     handle
         .sender
@@ -674,9 +779,12 @@ pub fn preview_remote_file(
         });
     }
 
-    let file = sftp
-        .open(Path::new(&path))
-        .map_err(|error| format!("读取 `{path}` 失败: {}。可能是权限不足，或者这不是可直接读取的普通文件。", to_error(error)))?;
+    let file = sftp.open(Path::new(&path)).map_err(|error| {
+        format!(
+            "读取 `{path}` 失败: {}。可能是权限不足，或者这不是可直接读取的普通文件。",
+            to_error(error)
+        )
+    })?;
     let mut content = Vec::new();
     file.take(TEXT_PREVIEW_LIMIT)
         .read_to_end(&mut content)
@@ -797,7 +905,9 @@ pub fn upload_windows_clipboard_files(
                     let filename = local_path
                         .file_name()
                         .and_then(|value| value.to_str())
-                        .ok_or_else(|| format!("本地文件名非法，没法上传：{}", local_path.display()))?;
+                        .ok_or_else(|| {
+                            format!("本地文件名非法，没法上传：{}", local_path.display())
+                        })?;
                     let sanitized_name = sanitize_upload_filename(filename)?;
                     let payload = std::fs::read(&local_path).map_err(|error| {
                         format!("读取本地文件 `{}` 失败: {error}", local_path.display())
@@ -873,7 +983,10 @@ pub fn download_remote_entry(
         remote_path: remote_path.clone(),
         local_path: final_destination.to_string_lossy().to_string(),
         bytes_written,
-        message: format!("已下载 `{remote_path}` 到 `{}`", final_destination.display()),
+        message: format!(
+            "已下载 `{remote_path}` 到 `{}`",
+            final_destination.display()
+        ),
     })
 }
 
@@ -980,6 +1093,7 @@ pub fn delete_remote_entry(
 
 fn spawn_terminal_worker(
     app: AppHandle,
+    terminal_id: String,
     session: Session,
     mut channel: ssh2::Channel,
     rx: mpsc::Receiver<TerminalCommand>,
@@ -988,8 +1102,10 @@ fn spawn_terminal_worker(
         let _ = app.emit(
             "terminal-status",
             TerminalStatus {
+                terminal_id: terminal_id.clone(),
                 kind: "connected".into(),
                 message: "SSH 会话已建立".into(),
+                connection_lost: false,
             },
         );
 
@@ -1000,76 +1116,110 @@ fn spawn_terminal_worker(
         let mut auto_prompt_wake_sent = false;
         let mut prompt_hint_emitted = false;
         let mut close_message = "SSH 会话已关闭".to_string();
+        let mut connection_lost = false;
         loop {
             match channel.read(&mut buffer) {
                 Ok(size) if size > 0 => {
                     received_initial_output = true;
                     let payload = String::from_utf8_lossy(&buffer[..size]).to_string();
-                    let _ = app.emit("terminal-chunk", TerminalChunk { data: payload });
+                    let _ = app.emit(
+                        "terminal-chunk",
+                        TerminalChunk {
+                            terminal_id: terminal_id.clone(),
+                            data: payload,
+                        },
+                    );
                 }
                 Ok(_) => {}
                 Err(error) if error.kind() == ErrorKind::WouldBlock => {}
                 Err(error) => {
+                    connection_lost = true;
                     close_message = format!("SSH 会话已断开，终端读取失败: {error}");
                     let _ = app.emit(
                         "terminal-status",
                         TerminalStatus {
+                            terminal_id: terminal_id.clone(),
                             kind: "error".into(),
                             message: format!("终端读取失败: {error}"),
+                            connection_lost: true,
                         },
                     );
                     break;
                 }
             }
 
-            match rx.try_recv() {
-                Ok(TerminalCommand::Input(data)) => {
-                    if let Err(error) = write_until_ready(&mut channel, data.as_bytes()) {
-                        close_message = format!("SSH 会话已断开，终端写入失败: {error}");
-                        let _ = app.emit(
-                            "terminal-status",
-                            TerminalStatus {
-                                kind: "error".into(),
-                                message: format!("终端写入失败: {error}"),
-                            },
-                        );
+            let mut should_break = false;
+            loop {
+                match rx.try_recv() {
+                    Ok(TerminalCommand::Input(data)) => {
+                        if let Err(error) = write_until_ready(&mut channel, data.as_bytes()) {
+                            connection_lost = true;
+                            close_message = format!("SSH 会话已断开，终端写入失败: {error}");
+                            let _ = app.emit(
+                                "terminal-status",
+                                TerminalStatus {
+                                    terminal_id: terminal_id.clone(),
+                                    kind: "error".into(),
+                                    message: format!("终端写入失败: {error}"),
+                                    connection_lost: true,
+                                },
+                            );
+                            should_break = true;
+                            break;
+                        }
+                    }
+                    Ok(TerminalCommand::Resize { cols, rows }) => {
+                        if let Err(error) = channel.request_pty_size(
+                            u32::from(cols),
+                            u32::from(rows),
+                            Some(0),
+                            Some(0),
+                        ) {
+                            let _ = app.emit(
+                                "terminal-status",
+                                TerminalStatus {
+                                    terminal_id: terminal_id.clone(),
+                                    kind: "warning".into(),
+                                    message: format!("终端尺寸更新失败: {}", to_error(error)),
+                                    connection_lost: false,
+                                },
+                            );
+                        }
+                    }
+                    Ok(TerminalCommand::Close) => {
+                        close_message = "终端窗口已关闭".into();
+                        let _ = channel.close();
+                        should_break = true;
+                        break;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        should_break = true;
                         break;
                     }
                 }
-                Ok(TerminalCommand::Resize { cols, rows }) => {
-                    if let Err(error) = channel.request_pty_size(
-                        u32::from(cols),
-                        u32::from(rows),
-                        Some(0),
-                        Some(0),
-                    ) {
-                        let _ = app.emit(
-                            "terminal-status",
-                            TerminalStatus {
-                                kind: "warning".into(),
-                                message: format!("终端尺寸更新失败: {}", to_error(error)),
-                            },
-                        );
-                    }
-                }
-                Ok(TerminalCommand::Close) => {
-                    close_message = "SSH 会话已断开".into();
-                    let _ = channel.close();
-                    break;
-                }
-                Err(mpsc::TryRecvError::Empty) => {}
-                Err(mpsc::TryRecvError::Disconnected) => break,
             }
 
-            if !received_initial_output && !auto_prompt_wake_sent && started_at.elapsed() >= SHELL_PROMPT_WAKE_DELAY {
+            if should_break {
+                break;
+            }
+
+            if !received_initial_output
+                && !auto_prompt_wake_sent
+                && started_at.elapsed() >= SHELL_PROMPT_WAKE_DELAY
+            {
                 match write_until_ready(&mut channel, b"\n") {
                     Ok(()) => {
                         auto_prompt_wake_sent = true;
                         let _ = app.emit(
                             "terminal-status",
                             TerminalStatus {
+                                terminal_id: terminal_id.clone(),
                                 kind: "warning".into(),
-                                message: "远端终端首屏没有返回提示符，已自动发送回车尝试唤起命令行。".into(),
+                                message:
+                                    "远端终端首屏没有返回提示符，已自动发送回车尝试唤起命令行。"
+                                        .into(),
+                                connection_lost: false,
                             },
                         );
                     }
@@ -1077,8 +1227,10 @@ fn spawn_terminal_worker(
                         let _ = app.emit(
                             "terminal-status",
                             TerminalStatus {
+                                terminal_id: terminal_id.clone(),
                                 kind: "warning".into(),
                                 message: format!("远端终端暂时没回提示符，自动唤起失败: {error}"),
+                                connection_lost: false,
                             },
                         );
                         auto_prompt_wake_sent = true;
@@ -1094,21 +1246,28 @@ fn spawn_terminal_worker(
                 let _ = app.emit(
                     "terminal-status",
                     TerminalStatus {
+                        terminal_id: terminal_id.clone(),
                         kind: "warning".into(),
                         message: "如果终端区域还是空白，可再按一次回车唤起远端命令行。".into(),
+                        connection_lost: false,
                     },
                 );
                 prompt_hint_emitted = true;
             }
 
-            if last_keepalive_at.elapsed() >= Duration::from_secs(u64::from(SSH_KEEPALIVE_INTERVAL_SECS)) {
+            if last_keepalive_at.elapsed()
+                >= Duration::from_secs(u64::from(SSH_KEEPALIVE_INTERVAL_SECS))
+            {
                 if let Err(error) = session.keepalive_send() {
+                    connection_lost = true;
                     close_message = format!("SSH 会话已断开，保活探测失败: {error}");
                     let _ = app.emit(
                         "terminal-status",
                         TerminalStatus {
+                            terminal_id: terminal_id.clone(),
                             kind: "error".into(),
                             message: format!("SSH 保活失败，连接可能已经断开: {error}"),
+                            connection_lost: true,
                         },
                     );
                     break;
@@ -1118,20 +1277,26 @@ fn spawn_terminal_worker(
 
             if channel.eof() {
                 if close_message == "SSH 会话已关闭" {
-                    close_message = "SSH 会话已断开，可能是远端 shell 退出或网络中断。".into();
+                    close_message = "当前终端会话已结束，可能是远端 shell 主动退出。".into();
                 }
                 break;
             }
 
-            thread::sleep(Duration::from_millis(12));
+            thread::sleep(Duration::from_millis(4));
         }
 
-        let _ = clear_runtime_connection_state(&app);
+        if connection_lost {
+            let _ = clear_runtime_connection_state(&app);
+        } else {
+            let _ = remove_terminal_handle(&app, &terminal_id);
+        }
         let _ = app.emit(
             "terminal-status",
             TerminalStatus {
+                terminal_id,
                 kind: "closed".into(),
                 message: close_message,
+                connection_lost,
             },
         );
     });
@@ -1143,7 +1308,7 @@ fn write_until_ready(channel: &mut ssh2::Channel, payload: &[u8]) -> Result<(), 
         match channel.write(&payload[sent..]) {
             Ok(size) => sent += size,
             Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(8));
+                thread::sleep(Duration::from_millis(2));
             }
             Err(error) => return Err(error.to_string()),
         }
@@ -1154,7 +1319,11 @@ fn write_until_ready(channel: &mut ssh2::Channel, payload: &[u8]) -> Result<(), 
 
 fn sanitize_local_name(name: &str) -> String {
     let trimmed = name.trim();
-    let fallback = if trimmed.is_empty() { "download" } else { trimmed };
+    let fallback = if trimmed.is_empty() {
+        "download"
+    } else {
+        trimmed
+    };
 
     fallback
         .chars()
@@ -1175,7 +1344,10 @@ fn unique_local_destination(initial: PathBuf) -> PathBuf {
         .file_stem()
         .and_then(|value| value.to_str())
         .unwrap_or("download");
-    let ext = initial.extension().and_then(|value| value.to_str()).unwrap_or("");
+    let ext = initial
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
 
     for index in 1..10_000 {
         let candidate_name = if ext.is_empty() {
@@ -1192,7 +1364,10 @@ fn unique_local_destination(initial: PathBuf) -> PathBuf {
     initial
 }
 
-fn create_authenticated_session(app: &AppHandle, request: &ConnectRequest) -> Result<Session, String> {
+fn create_authenticated_session(
+    app: &AppHandle,
+    request: &ConnectRequest,
+) -> Result<Session, String> {
     create_authenticated_session_inner(request, Some(app))
 }
 
@@ -1208,7 +1383,10 @@ fn prefers_legacy_ssh_compat(raw: &str) -> bool {
         || lower.contains("algorithm")
 }
 
-fn apply_ssh_handshake_profile(session: &Session, profile: SshHandshakeProfile) -> Result<(), String> {
+fn apply_ssh_handshake_profile(
+    session: &Session,
+    profile: SshHandshakeProfile,
+) -> Result<(), String> {
     if profile == SshHandshakeProfile::Default {
         return Ok(());
     }
@@ -1237,7 +1415,10 @@ fn apply_ssh_handshake_profile(session: &Session, profile: SshHandshakeProfile) 
     Ok(())
 }
 
-fn create_handshaked_session(request: &ConnectRequest, profile: SshHandshakeProfile) -> Result<Session, String> {
+fn create_handshaked_session(
+    request: &ConnectRequest,
+    profile: SshHandshakeProfile,
+) -> Result<Session, String> {
     let tcp = connect_tcp_stream(request)?;
     tcp.set_read_timeout(Some(SSH_IO_TIMEOUT))
         .map_err(|error| format!("设置 TCP 读取超时失败: {error}"))?;
@@ -1292,11 +1473,23 @@ fn create_authenticated_session_inner(
                     );
                 }
 
-                create_handshaked_session(request, SshHandshakeProfile::LegacyCompat).map_err(|legacy_error| {
-                    explain_ssh_handshake_error(&request.host, request.port, &legacy_error, true)
-                })?
+                create_handshaked_session(request, SshHandshakeProfile::LegacyCompat).map_err(
+                    |legacy_error| {
+                        explain_ssh_handshake_error(
+                            &request.host,
+                            request.port,
+                            &legacy_error,
+                            true,
+                        )
+                    },
+                )?
             } else {
-                return Err(explain_ssh_handshake_error(&request.host, request.port, &raw_error, false));
+                return Err(explain_ssh_handshake_error(
+                    &request.host,
+                    request.port,
+                    &raw_error,
+                    false,
+                ));
             }
         }
     };
@@ -1337,7 +1530,9 @@ fn resolve_home_path(session: &Session) -> Result<String, String> {
 fn resolve_remote_identity(session: &Session) -> Result<(Option<u32>, Vec<u32>), String> {
     let output = run_remote_command(session, "id -u; id -G")?;
     let mut lines = output.lines();
-    let user_uid = lines.next().and_then(|value| value.trim().parse::<u32>().ok());
+    let user_uid = lines
+        .next()
+        .and_then(|value| value.trim().parse::<u32>().ok());
     let group_ids = lines
         .next()
         .unwrap_or_default()
@@ -1356,7 +1551,10 @@ fn run_remote_command(session: &Session, command: &str) -> Result<String, String
     channel.read_to_string(&mut output).map_err(to_error)?;
 
     let mut stderr = String::new();
-    channel.stderr().read_to_string(&mut stderr).map_err(to_error)?;
+    channel
+        .stderr()
+        .read_to_string(&mut stderr)
+        .map_err(to_error)?;
     channel.wait_close().map_err(to_error)?;
 
     if channel.exit_status().map_err(to_error)? != 0 {
@@ -1374,7 +1572,11 @@ fn parse_cpu_stat_line(line: &str) -> Result<(u64, u64), String> {
     let values = line
         .split_whitespace()
         .skip(1)
-        .map(|value| value.parse::<u64>().map_err(|error| format!("解析 CPU 采样失败: {error}")))
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .map_err(|error| format!("解析 CPU 采样失败: {error}"))
+        })
         .collect::<Result<Vec<_>, _>>()?;
 
     if values.len() < 5 {
@@ -1382,14 +1584,19 @@ fn parse_cpu_stat_line(line: &str) -> Result<(u64, u64), String> {
     }
 
     let total = values.iter().sum::<u64>();
-    let idle = values.get(3).copied().unwrap_or_default() + values.get(4).copied().unwrap_or_default();
+    let idle =
+        values.get(3).copied().unwrap_or_default() + values.get(4).copied().unwrap_or_default();
     Ok((idle, total))
 }
 
 fn parse_net_dev_line(line: &str) -> Result<(u64, u64), String> {
     let values = line
         .split_whitespace()
-        .map(|value| value.parse::<u64>().map_err(|error| format!("解析网络流量采样失败: {error}")))
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .map_err(|error| format!("解析网络流量采样失败: {error}"))
+        })
         .collect::<Result<Vec<_>, _>>()?;
 
     if values.len() < 2 {
@@ -1424,7 +1631,10 @@ fn read_remote_system_snapshot(session: &Session) -> Result<RemoteSystemSnapshot
         .collect::<Vec<_>>();
 
     if lines.len() < 11 {
-        return Err(format!("远端系统信息返回不完整，当前只拿到 {} 行。", lines.len()));
+        return Err(format!(
+            "远端系统信息返回不完整，当前只拿到 {} 行。",
+            lines.len()
+        ));
     }
 
     let (idle_1, total_1) = parse_cpu_stat_line(lines[0])?;
@@ -1444,7 +1654,11 @@ fn read_remote_system_snapshot(session: &Session) -> Result<RemoteSystemSnapshot
     let load_average = lines[4]
         .split_whitespace()
         .take(3)
-        .map(|value| value.parse::<f64>().map_err(|error| format!("解析负载失败: {error}")))
+        .map(|value| {
+            value
+                .parse::<f64>()
+                .map_err(|error| format!("解析负载失败: {error}"))
+        })
         .collect::<Result<Vec<_>, _>>()?;
     if load_average.len() != 3 {
         return Err("远端负载信息不完整。".into());
@@ -1491,8 +1705,10 @@ fn read_remote_system_snapshot(session: &Session) -> Result<RemoteSystemSnapshot
     let (net_rx_1, net_tx_1) = parse_net_dev_line(lines[9])?;
     let (net_rx_2, net_tx_2) = parse_net_dev_line(lines[10])?;
     let network_interval_seconds = 0.3_f64;
-    let network_rx_bytes_per_sec = net_rx_2.saturating_sub(net_rx_1) as f64 / network_interval_seconds;
-    let network_tx_bytes_per_sec = net_tx_2.saturating_sub(net_tx_1) as f64 / network_interval_seconds;
+    let network_rx_bytes_per_sec =
+        net_rx_2.saturating_sub(net_rx_1) as f64 / network_interval_seconds;
+    let network_tx_bytes_per_sec =
+        net_tx_2.saturating_sub(net_tx_1) as f64 / network_interval_seconds;
     let top_processes = lines
         .iter()
         .skip(11)
@@ -1533,9 +1749,13 @@ fn download_remote_file_to_path(
             .map_err(|error| format!("创建本地目录 `{}` 失败: {error}", parent.display()))?;
     }
 
-    let mut remote_file = sftp
-        .open(remote_path)
-        .map_err(|error| format!("读取远端文件 `{}` 失败: {}", remote_path.display(), to_error(error)))?;
+    let mut remote_file = sftp.open(remote_path).map_err(|error| {
+        format!(
+            "读取远端文件 `{}` 失败: {}",
+            remote_path.display(),
+            to_error(error)
+        )
+    })?;
     let mut local_file = fs::File::create(local_path)
         .map_err(|error| format!("创建本地文件 `{}` 失败: {error}", local_path.display()))?;
 
@@ -1566,9 +1786,13 @@ fn download_remote_directory_recursive(
     fs::create_dir_all(local_dir)
         .map_err(|error| format!("创建本地目录 `{}` 失败: {error}", local_dir.display()))?;
 
-    let entries = sftp
-        .readdir(remote_dir)
-        .map_err(|error| format!("读取远端目录 `{}` 失败: {}", remote_dir.display(), to_error(error)))?;
+    let entries = sftp.readdir(remote_dir).map_err(|error| {
+        format!(
+            "读取远端目录 `{}` 失败: {}",
+            remote_dir.display(),
+            to_error(error)
+        )
+    })?;
 
     let mut total = 0_u64;
     for (entry_path, stat) in entries {
@@ -1665,7 +1889,11 @@ fn image_mime_type(path: &str) -> &'static str {
     }
 }
 
-fn write_remote_payload(sftp: &ssh2::Sftp, remote_path: &str, payload: &[u8]) -> Result<(), String> {
+fn write_remote_payload(
+    sftp: &ssh2::Sftp,
+    remote_path: &str,
+    payload: &[u8],
+) -> Result<(), String> {
     let mut file = sftp
         .create(Path::new(remote_path))
         .map_err(|error| explain_remote_write_error("创建", remote_path, error))?;
@@ -1679,11 +1907,7 @@ fn write_remote_payload(sftp: &ssh2::Sftp, remote_path: &str, payload: &[u8]) ->
 
 fn sanitize_upload_filename(filename: &str) -> Result<String, String> {
     let trimmed = filename.trim();
-    let candidate = trimmed
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(trimmed)
-        .trim();
+    let candidate = trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed).trim();
 
     if candidate.is_empty() {
         return Err("上传文件名为空，没法往远端写。".into());
@@ -1698,7 +1922,11 @@ fn sanitize_upload_filename(filename: &str) -> Result<String, String> {
 
 fn join_remote_path(dir: &str, filename: &str) -> String {
     let owned = normalize_remote_path(dir);
-    let normalized = if owned.trim().is_empty() { "/" } else { owned.trim() };
+    let normalized = if owned.trim().is_empty() {
+        "/"
+    } else {
+        owned.trim()
+    };
     if normalized == "/" {
         format!("/{filename}")
     } else {
@@ -1712,7 +1940,10 @@ fn parent_remote_path(path: &str) -> String {
         return "/".into();
     }
 
-    let mut segments = normalized.split('/').filter(|segment| !segment.is_empty()).collect::<Vec<_>>();
+    let mut segments = normalized
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
     if segments.len() <= 1 {
         return "/".into();
     }
@@ -1863,7 +2094,11 @@ fn resolve_entry_access(stat: &FileStat, connection: &StoredConnection) -> (bool
         return (true, true, true);
     };
 
-    let scope_shift = if connection.user_uid.zip(stat.uid).is_some_and(|(left, right)| left == right) {
+    let scope_shift = if connection
+        .user_uid
+        .zip(stat.uid)
+        .is_some_and(|(left, right)| left == right)
+    {
         6
     } else if stat
         .gid
@@ -2180,9 +2415,9 @@ fn explain_remote_manage_error(
 }
 
 fn remove_remote_directory_recursive(sftp: &ssh2::Sftp, remote_dir: &Path) -> Result<(), String> {
-    let entries = sftp
-        .readdir(remote_dir)
-        .map_err(|error| explain_remote_manage_error("读取目录", &remote_dir.display().to_string(), error))?;
+    let entries = sftp.readdir(remote_dir).map_err(|error| {
+        explain_remote_manage_error("读取目录", &remote_dir.display().to_string(), error)
+    })?;
 
     for (entry_path, stat) in entries {
         let normalized_path = normalize_remote_path(&entry_path.to_string_lossy());
@@ -2203,8 +2438,9 @@ fn remove_remote_directory_recursive(sftp: &ssh2::Sftp, remote_dir: &Path) -> Re
         if is_dir {
             remove_remote_directory_recursive(sftp, Path::new(&normalized_path))?;
         } else {
-            sftp.unlink(Path::new(&normalized_path))
-                .map_err(|error| explain_remote_manage_error("删除文件", &normalized_path, error))?;
+            sftp.unlink(Path::new(&normalized_path)).map_err(|error| {
+                explain_remote_manage_error("删除文件", &normalized_path, error)
+            })?;
         }
     }
 
@@ -2220,8 +2456,7 @@ mod windows_clipboard {
         mem,
         os::windows::ffi::OsStringExt,
         path::PathBuf,
-        ptr,
-        slice,
+        ptr, slice,
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -2267,8 +2502,8 @@ mod windows_clipboard {
     pub fn read_clipboard_items() -> Result<Vec<ClipboardItem>, String> {
         unsafe {
             let has_files = IsClipboardFormatAvailable(CF_HDROP) != 0;
-            let has_image =
-                IsClipboardFormatAvailable(CF_DIBV5) != 0 || IsClipboardFormatAvailable(CF_DIB) != 0;
+            let has_image = IsClipboardFormatAvailable(CF_DIBV5) != 0
+                || IsClipboardFormatAvailable(CF_DIB) != 0;
 
             if !has_files && !has_image {
                 return Ok(Vec::new());
@@ -2280,7 +2515,8 @@ mod windows_clipboard {
 
             let result = if has_files {
                 read_drop_file_list().map(|paths| {
-                    paths.into_iter()
+                    paths
+                        .into_iter()
                         .map(ClipboardItem::LocalFile)
                         .collect::<Vec<_>>()
                 })

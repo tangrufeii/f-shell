@@ -1,7 +1,8 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import HostDetailPanel from "./HostDetailPanel";
 import ServerMetricsPanel from "./ServerMetricsPanel";
+import { isLikelyRuntimeDisconnectMessage } from "../lib/runtimeConnection";
 import type { ConnectionSummary, RemoteSystemSnapshot } from "../types";
 
 type HostRuntimeSectionProps = {
@@ -9,6 +10,7 @@ type HostRuntimeSectionProps = {
   connectionHostText: string;
   basicLatencyLabel: string;
   pollIntervalMs?: number;
+  onConnectionIssue?: (message: string) => void;
   children: (content: { detailButton: ReactNode; metricsPanel: ReactNode }) => ReactNode;
 };
 
@@ -62,10 +64,18 @@ export default function HostRuntimeSection({
   connectionHostText,
   basicLatencyLabel,
   pollIntervalMs = 1000,
+  onConnectionIssue,
   children
 }: HostRuntimeSectionProps) {
   const [systemSnapshot, setSystemSnapshot] = useState<RemoteSystemSnapshot | null>(null);
   const [systemSnapshotError, setSystemSnapshotError] = useState("");
+  const failedPollCountRef = useRef(0);
+  const reportedConnectionIssueRef = useRef(false);
+  const onConnectionIssueRef = useRef(onConnectionIssue);
+
+  useEffect(() => {
+    onConnectionIssueRef.current = onConnectionIssue;
+  }, [onConnectionIssue]);
 
   useEffect(() => {
     let cancelled = false;
@@ -79,12 +89,25 @@ export default function HostRuntimeSection({
         }
         setSystemSnapshot(snapshot);
         setSystemSnapshotError("");
+        failedPollCountRef.current = 0;
+        reportedConnectionIssueRef.current = false;
       } catch (error) {
         if (cancelled) {
           return;
         }
+        const message = String(error);
         console.error(error);
-        setSystemSnapshotError(String(error));
+        setSystemSnapshotError(message);
+        failedPollCountRef.current += 1;
+        if (
+          onConnectionIssueRef.current &&
+          !reportedConnectionIssueRef.current &&
+          failedPollCountRef.current >= 2 &&
+          isLikelyRuntimeDisconnectMessage(message)
+        ) {
+          reportedConnectionIssueRef.current = true;
+          onConnectionIssueRef.current(message);
+        }
       } finally {
         if (!cancelled) {
           timer = window.setTimeout(() => {
