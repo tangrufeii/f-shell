@@ -41,6 +41,7 @@ import ConnectDialog from "./components/ConnectDialog";
 import HostRuntimeSection from "./components/HostRuntimeSection";
 import PasswordStorageDialog from "./components/PasswordStorageDialog";
 import RemoteFileTree, { type RemoteFileTreeNode } from "./components/RemoteFileTree";
+import TerminalTabContextMenu, { type TerminalTabContextMenuState } from "./components/TerminalTabContextMenu";
 import TerminalToolbar from "./components/TerminalToolbar";
 import TopToolbar from "./components/TopToolbar";
 import TreeContextMenu from "./components/TreeContextMenu";
@@ -68,6 +69,7 @@ type EntryMap = Record<string, RemoteEntry[]>;
 type ResizeDirection = "East" | "North" | "NorthEast" | "NorthWest" | "South" | "SouthEast" | "SouthWest" | "West";
 type TerminalSearchMatch = { row: number; col: number; length: number };
 type TextSearchMatch = { start: number; end: number };
+type CommittedTerminalCommand = { command: string; cwd: string };
 type ConnectFieldErrors = Partial<Record<keyof ConnectionForm, string>>;
 type FileActionMode = "new-file" | "new-directory" | "rename" | "delete";
 type FileActionErrors = {
@@ -736,6 +738,143 @@ function buildCdCommand(path: string): string {
   return `cd ${shellEscapePath(path)}\r`;
 }
 
+function normalizePosixPath(path: string): string {
+  const isAbsolute = path.startsWith("/");
+  const segments = path.split("/");
+  const normalized: string[] = [];
+
+  for (const segment of segments) {
+    if (!segment || segment === ".") {
+      continue;
+    }
+
+    if (segment === "..") {
+      if (normalized.length) {
+        normalized.pop();
+      }
+      continue;
+    }
+
+    normalized.push(segment);
+  }
+
+  if (!isAbsolute) {
+    return normalized.join("/") || ".";
+  }
+
+  return normalized.length ? `/${normalized.join("/")}` : "/";
+}
+
+function resolvePosixPath(basePath: string, candidate: string): string {
+  if (!candidate) {
+    return normalizePosixPath(basePath || "/");
+  }
+
+  if (candidate.startsWith("/")) {
+    return normalizePosixPath(candidate);
+  }
+
+  const normalizedBase = normalizePosixPath(basePath || "/");
+  const prefix = normalizedBase === "/" ? "/" : `${normalizedBase}/`;
+  return normalizePosixPath(`${prefix}${candidate}`);
+}
+
+function parseCdTarget(command: string): string | null {
+  const matched = command.match(/^cd(?:\s+(.*))?$/);
+  if (!matched) {
+    return null;
+  }
+
+  const rawTarget = matched[1]?.trim() ?? "";
+  if (!rawTarget) {
+    return "";
+  }
+
+  if (rawTarget === "-") {
+    return null;
+  }
+
+  const withoutOption = rawTarget.startsWith("-- ") ? rawTarget.slice(3).trim() : rawTarget;
+
+  if (withoutOption.startsWith("'") && withoutOption.endsWith("'")) {
+    return withoutOption.slice(1, -1).replace(/'\\''/g, "'");
+  }
+
+  if (withoutOption.startsWith("\"") && withoutOption.endsWith("\"")) {
+    return withoutOption.slice(1, -1).replace(/\\(["\\$`])/g, "$1");
+  }
+
+  return withoutOption;
+}
+
+function resolveTerminalDirectory(homePath: string, currentDirectory: string, nextDirectory: string): string {
+  const normalizedHomePath = normalizePosixPath(homePath || "/");
+  const normalizedCurrentDirectory = normalizePosixPath(currentDirectory || normalizedHomePath);
+  const trimmedDirectory = nextDirectory.trim();
+
+  if (!trimmedDirectory || trimmedDirectory === "~") {
+    return normalizedHomePath;
+  }
+
+  if (trimmedDirectory.startsWith("~/")) {
+    return resolvePosixPath(normalizedHomePath, trimmedDirectory.slice(2));
+  }
+
+  if (trimmedDirectory.startsWith("~")) {
+    return resolvePosixPath(normalizedHomePath, trimmedDirectory.slice(1));
+  }
+
+  return resolvePosixPath(normalizedCurrentDirectory, trimmedDirectory);
+}
+
+function predictTerminalDirectoryAfterCommand(
+  command: string,
+  currentDirectory: string,
+  homePath: string
+): string | null {
+  const target = parseCdTarget(command.trim());
+  if (target == null) {
+    return null;
+  }
+
+  return resolveTerminalDirectory(homePath, currentDirectory, target);
+}
+
+function extractPromptDirectory(line: string, homePath: string): string | null {
+  const matched = line.match(/^[^\r\n]*@[^:\r\n]+:(.+?)[#$]\s?.*$/);
+  if (!matched) {
+    return null;
+  }
+
+  const rawDirectory = matched[1]?.trim();
+  if (!rawDirectory) {
+    return null;
+  }
+
+  return resolveTerminalDirectory(homePath, homePath, rawDirectory);
+}
+
+function extractLatestPromptDirectory(output: string, homePath: string): string | null {
+  if (!output) {
+    return null;
+  }
+
+  const lines = output.replace(/\r\n/g, "\n").split("\n");
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index]?.trimEnd() ?? "";
+    if (!line) {
+      continue;
+    }
+
+    const directory = extractPromptDirectory(line, homePath);
+    if (directory) {
+      return directory;
+    }
+  }
+
+  return null;
+}
+
 function transferHasFiles(data: DataTransfer | null): boolean {
   if (!data) {
     return false;
@@ -1285,6 +1424,7 @@ function App() {
   const [connectFieldErrors, setConnectFieldErrors] = useState<ConnectFieldErrors>({});
   const [saveFeedback, setSaveFeedback] = useState<SaveFeedbackState | null>(null);
   const [treeContextMenu, setTreeContextMenu] = useState<TreeContextMenuState | null>(null);
+  const [terminalTabContextMenu, setTerminalTabContextMenu] = useState<TerminalTabContextMenuState | null>(null);
   const [fileActionDialog, setFileActionDialog] = useState<FileActionDialogState | null>(null);
   const [passwordStorageDialog, setPasswordStorageDialog] = useState<PasswordStorageDialogState | null>(null);
   const [commandHistory, setCommandHistory] = useState<CommandHistoryItem[]>(() => readStoredHistory());
@@ -1292,6 +1432,7 @@ function App() {
   const [hasCommandDraft, setHasCommandDraft] = useState(false);
   const [terminalTabs, setTerminalTabs] = useState<TerminalTab[]>([]);
   const [activeTerminalId, setActiveTerminalId] = useState("");
+  const [activeTerminalCwd, setActiveTerminalCwd] = useState("");
   const [terminalTabsOverflow, setTerminalTabsOverflow] = useState<TerminalTabsOverflowState>({
     canScrollLeft: false,
     canScrollRight: false
@@ -1313,6 +1454,7 @@ function App() {
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const editorRef = useRef<MonacoEditor.IStandaloneCodeEditor | null>(null);
   const historyMenuRef = useRef<HTMLDivElement | null>(null);
+  const terminalTabContextMenuRef = useRef<HTMLDivElement | null>(null);
   const treeContextMenuRef = useRef<HTMLDivElement | null>(null);
   const fileActionInputRef = useRef<HTMLInputElement | null>(null);
   const sidebarResizeStateRef = useRef<{ startX: number; startWidth: number } | null>(null);
@@ -1321,6 +1463,7 @@ function App() {
   const terminalPromptWakeTimeoutsRef = useRef<Record<string, number>>({});
   const terminalOutputsRef = useRef<Record<string, string>>({});
   const terminalInputBuffersRef = useRef<Record<string, string>>({});
+  const terminalDirectoriesRef = useRef<Record<string, string>>({});
   const terminalViewportSizesRef = useRef<TerminalViewportSizeMap>({});
   const terminalSearchMatchesRef = useRef<TerminalSearchMatch[]>([]);
   const previewSearchMatchesRef = useRef<TextSearchMatch[]>([]);
@@ -1329,6 +1472,46 @@ function App() {
   const runtimeDisconnectHandledRef = useRef(false);
   const isNarrowWorkbench = viewportWidth <= NARROW_LAYOUT_BREAKPOINT;
   const deferredSearchQuery = useDeferredValue(searchQuery);
+
+  function getFallbackTerminalDirectory() {
+    return normalizePosixPath(connection?.homePath || "/");
+  }
+
+  function getTerminalDirectory(terminalId: string) {
+    if (!terminalId) {
+      return getFallbackTerminalDirectory();
+    }
+
+    return normalizePosixPath(terminalDirectoriesRef.current[terminalId] || getFallbackTerminalDirectory());
+  }
+
+  function setTerminalDirectory(terminalId: string, directory: string) {
+    if (!terminalId) {
+      return;
+    }
+
+    const normalizedDirectory = normalizePosixPath(directory || getFallbackTerminalDirectory());
+    if (terminalDirectoriesRef.current[terminalId] === normalizedDirectory) {
+      return;
+    }
+
+    terminalDirectoriesRef.current[terminalId] = normalizedDirectory;
+    if (terminalId === activeTerminalIdRef.current) {
+      setActiveTerminalCwd((previous) => (previous === normalizedDirectory ? previous : normalizedDirectory));
+    }
+  }
+
+  function syncTerminalDirectoryFromOutput(terminalId: string) {
+    const homePath = connection?.homePath;
+    if (!homePath) {
+      return;
+    }
+
+    const directory = extractLatestPromptDirectory(terminalOutputsRef.current[terminalId] ?? "", homePath);
+    if (directory) {
+      setTerminalDirectory(terminalId, directory);
+    }
+  }
 
   useEffect(() => {
     void bootstrap();
@@ -1351,8 +1534,15 @@ function App() {
   }, [terminalTabs]);
 
   useEffect(() => {
+    if (terminalTabContextMenu && !terminalTabs.some((item) => item.id === terminalTabContextMenu.terminalId)) {
+      setTerminalTabContextMenu(null);
+    }
+  }, [terminalTabContextMenu, terminalTabs]);
+
+  useEffect(() => {
     activeTerminalIdRef.current = activeTerminalId;
     currentInputBufferRef.current = activeTerminalId ? terminalInputBuffersRef.current[activeTerminalId] ?? "" : "";
+    setActiveTerminalCwd(activeTerminalId ? getTerminalDirectory(activeTerminalId) : getFallbackTerminalDirectory());
     if (activeTerminalId) {
       setTerminalTabs((previous) =>
         previous.map((item) => (item.id === activeTerminalId ? { ...item, hasUnreadOutput: false } : item))
@@ -1433,6 +1623,7 @@ function App() {
     if (terminalId) {
       const output = sanitizeTerminalReplayOutput(terminalOutputsRef.current[terminalId] ?? "");
       terminalOutputsRef.current[terminalId] = output;
+      syncTerminalDirectoryFromOutput(terminalId);
       if (output) {
         terminal.write(output);
       }
@@ -1455,11 +1646,13 @@ function App() {
     terminalPromptWakeTimeoutsRef.current = {};
     terminalOutputsRef.current = {};
     terminalInputBuffersRef.current = {};
+    terminalDirectoriesRef.current = {};
     terminalViewportSizesRef.current = {};
     activeTerminalIdRef.current = "";
     currentInputBufferRef.current = "";
     setTerminalTabs([]);
     setActiveTerminalId("");
+    setActiveTerminalCwd("");
   }
 
   function clearScheduledTerminalPromptWake(terminalId: string) {
@@ -1499,19 +1692,21 @@ function App() {
         clearScheduledTerminalPromptWake(terminalId);
         delete terminalOutputsRef.current[terminalId];
         delete terminalInputBuffersRef.current[terminalId];
+        delete terminalDirectoriesRef.current[terminalId];
         delete terminalViewportSizesRef.current[terminalId];
       }
     });
     nextTabs.forEach((item) => {
       terminalOutputsRef.current[item.id] ??= "";
       terminalInputBuffersRef.current[item.id] ??= "";
+      terminalDirectoriesRef.current[item.id] ??= getFallbackTerminalDirectory();
     });
-    setTerminalTabs((previous) =>
-      nextTabs.map((item) => ({
-        ...item,
-        hasUnreadOutput: previous.find((entry) => entry.id === item.id)?.hasUnreadOutput ?? false
-      }))
-    );
+    const mergedTabs = nextTabs.map((item) => ({
+      ...item,
+      hasUnreadOutput: terminalTabsRef.current.find((entry) => entry.id === item.id)?.hasUnreadOutput ?? false
+    }));
+    terminalTabsRef.current = mergedTabs;
+    setTerminalTabs(mergedTabs);
     const previousActiveTerminalId = activeTerminalIdRef.current;
     const nextActiveTerminalId =
       options?.activateId && nextIds.has(options.activateId)
@@ -1524,6 +1719,7 @@ function App() {
       ? terminalInputBuffersRef.current[nextActiveTerminalId] ?? ""
       : "";
     setActiveTerminalId(nextActiveTerminalId);
+    setActiveTerminalCwd(nextActiveTerminalId ? getTerminalDirectory(nextActiveTerminalId) : getFallbackTerminalDirectory());
   }
 
   function handleRuntimeDisconnect(rawMessage: string) {
@@ -1534,6 +1730,7 @@ function App() {
     runtimeDisconnectHandledRef.current = true;
     const message = rawMessage.trim() || "SSH 会话已断开，请重新连接。";
     setConnection(null);
+    hasConnectionRef.current = false;
     setConnectionProgress((previous) => ({
       stage: "error",
       message: "SSH 会话已断开",
@@ -1723,27 +1920,67 @@ function App() {
     terminalPromptWakeTimeoutsRef.current[terminalId] = timeoutId;
   }
 
-  async function closeTerminalTab(terminalId: string) {
-    const target = terminalTabs.find((item) => item.id === terminalId);
+  async function closeTerminalTab(
+    terminalId: string,
+    options?: {
+      silent?: boolean;
+      suppressCreateIfEmpty?: boolean;
+    }
+  ) {
+    const target = terminalTabsRef.current.find((item) => item.id === terminalId);
+    if (!target) {
+      return false;
+    }
+
+    setTerminalTabContextMenu(null);
     try {
       await invoke("close_terminal_session", { terminalId });
     } catch (error) {
       console.error(error);
       const message = String(error);
       if (consumeRuntimeDisconnect(message)) {
-        return;
+        return false;
       }
       setStatusLine(`关闭终端失败: ${message}`);
-      return;
+      return false;
     }
 
-    const nextTabs = terminalTabs
+    const nextTabs = terminalTabsRef.current
       .filter((item) => item.id !== terminalId)
       .map(({ id, title }) => ({ id, title }));
     upsertTerminalTabs(nextTabs);
-    setStatusLine(target ? `${target.title} 已关闭` : "终端窗口已关闭");
-    if (!nextTabs.length && connection) {
+    if (!options?.silent) {
+      setStatusLine(`${target.title} 已关闭`);
+    }
+    if (!nextTabs.length && connection && !options?.suppressCreateIfEmpty) {
       void createTerminalTab();
+    }
+    return true;
+  }
+
+  async function closeMultipleTerminalTabs(terminalIds: string[], summary: string) {
+    const uniqueTerminalIds = Array.from(new Set(terminalIds)).filter((terminalId) =>
+      terminalTabsRef.current.some((item) => item.id === terminalId)
+    );
+    if (!uniqueTerminalIds.length) {
+      return;
+    }
+
+    setTerminalTabContextMenu(null);
+    let closedCount = 0;
+
+    for (const terminalId of uniqueTerminalIds) {
+      const closed = await closeTerminalTab(terminalId, {
+        silent: true,
+        suppressCreateIfEmpty: true
+      });
+      if (closed) {
+        closedCount += 1;
+      }
+    }
+
+    if (closedCount > 0) {
+      setStatusLine(summary.replace(String(uniqueTerminalIds.length), String(closedCount)));
     }
   }
 
@@ -1907,11 +2144,16 @@ function App() {
         return;
       }
 
+      if (terminalTabContextMenuRef.current && terminalTabContextMenuRef.current.contains(event.target as Node)) {
+        return;
+      }
+
       if (treeContextMenuRef.current && treeContextMenuRef.current.contains(event.target as Node)) {
         return;
       }
 
       setIsHistoryMenuOpen(false);
+      setTerminalTabContextMenu(null);
       setTreeContextMenu(null);
     };
 
@@ -1924,6 +2166,7 @@ function App() {
   useEffect(() => {
     const handleEscape = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
+        setTerminalTabContextMenu(null);
         setTreeContextMenu(null);
         setFileActionDialog(null);
         setIsAboutDialogOpen(false);
@@ -2372,7 +2615,7 @@ function App() {
       const committedCommands = trackTerminalInput(data, terminalId);
       void sendToActiveTerminal(data)
         .then(() => {
-          committedCommands.forEach((command) => rememberCommand(command));
+          committedCommands.forEach((item) => rememberCommand(item.command, item.cwd));
         })
         .catch((error) => {
           console.error(error);
@@ -2389,6 +2632,7 @@ function App() {
 
     void listen<TerminalChunk>("terminal-chunk", (event) => {
       const promptArtifactCollapsed = appendTerminalOutput(event.payload.terminalId, event.payload.data);
+      syncTerminalDirectoryFromOutput(event.payload.terminalId);
       if (hasPromptTail(terminalOutputsRef.current[event.payload.terminalId] ?? "")) {
         clearScheduledTerminalPromptWake(event.payload.terminalId);
       }
@@ -2486,6 +2730,7 @@ function App() {
 
     const data = await invoke<ShellOverview>("get_shell_overview");
     setConnection(data.connection);
+    hasConnectionRef.current = Boolean(data.connection);
     if (data.connection?.homePath) {
       runtimeDisconnectHandledRef.current = false;
       const sessions = await loadTerminalTabs({ createIfEmpty: true });
@@ -2713,6 +2958,7 @@ function App() {
       });
 
       setConnection(result);
+      hasConnectionRef.current = true;
       runtimeDisconnectHandledRef.current = false;
       setForm(sourceForm);
       resetTerminalTabState();
@@ -2759,6 +3005,7 @@ function App() {
       console.error(error);
       const message = String(error);
       setConnection(null);
+      hasConnectionRef.current = false;
       clearRemoteBrowserState();
       setStatusLine(message);
       setConnectError(message);
@@ -2794,6 +3041,7 @@ function App() {
       console.error(error);
     }
     setConnection(null);
+    hasConnectionRef.current = false;
     setConnectionProgress(null);
     setConnectError("");
     resetTerminalTabState();
@@ -2922,8 +3170,7 @@ function App() {
     }
   }
 
-  function rememberCommand(command: string) {
-    const cwd = currentPath || connection?.homePath || "/";
+  function rememberCommand(command: string, cwd = getTerminalDirectory(activeTerminalIdRef.current)) {
     setCommandHistory((previous) => pushCommandHistory(previous, command, cwd));
     setHistorySelection(command.trim());
   }
@@ -2941,8 +3188,8 @@ function App() {
     setDragTargetPath("");
   }
 
-  function trackTerminalInput(data: string, terminalId = activeTerminalIdRef.current): string[] {
-    const committedCommands: string[] = [];
+  function trackTerminalInput(data: string, terminalId = activeTerminalIdRef.current): CommittedTerminalCommand[] {
+    const committedCommands: CommittedTerminalCommand[] = [];
     if (!terminalId) {
       return committedCommands;
     }
@@ -2952,12 +3199,24 @@ function App() {
     }
 
     let next = terminalInputBuffersRef.current[terminalId] ?? "";
+    let currentDirectory = getTerminalDirectory(terminalId);
 
     for (const char of data) {
       if (char === "\r") {
         const committed = next.trim();
         if (committed) {
-          committedCommands.push(committed);
+          committedCommands.push({
+            command: committed,
+            cwd: currentDirectory
+          });
+          const predictedDirectory = predictTerminalDirectoryAfterCommand(
+            committed,
+            currentDirectory,
+            connection?.homePath || currentDirectory
+          );
+          if (predictedDirectory) {
+            currentDirectory = predictedDirectory;
+          }
         }
         next = "";
         continue;
@@ -2983,6 +3242,7 @@ function App() {
     }
 
     syncCommandDraft(next, terminalId);
+    setTerminalDirectory(terminalId, currentDirectory);
     return committedCommands;
   }
 
@@ -3107,6 +3367,14 @@ function App() {
     try {
       await sendToActiveTerminal("\r");
       rememberCommand(currentLine);
+      const predictedDirectory = predictTerminalDirectoryAfterCommand(
+        currentLine,
+        getTerminalDirectory(activeTerminalIdRef.current),
+        connection?.homePath || getTerminalDirectory(activeTerminalIdRef.current)
+      );
+      if (predictedDirectory) {
+        setTerminalDirectory(activeTerminalIdRef.current, predictedDirectory);
+      }
       syncCommandDraft("");
       setStatusLine(`已执行命令: ${currentLine}`);
       terminalRef.current?.focus();
@@ -3590,7 +3858,7 @@ function App() {
         const pastedPaths = results.map((item) => shellEscapePath(item.path)).join(" ");
         if (pastedPaths) {
           await sendToActiveTerminal(pastedPaths);
-          trackTerminalInput(pastedPaths).forEach((command) => rememberCommand(command));
+          trackTerminalInput(pastedPaths).forEach((item) => rememberCommand(item.command, item.cwd));
           setActiveWorkspace("terminal");
           terminalRef.current?.focus();
           setStatusLine(`已上传剪贴板内容到 ${targetDir}，并填入终端路径`);
@@ -3629,7 +3897,7 @@ function App() {
 
     try {
       await sendToActiveTerminal(text);
-      trackTerminalInput(text).forEach((command) => rememberCommand(command));
+      trackTerminalInput(text).forEach((item) => rememberCommand(item.command, item.cwd));
       setActiveWorkspace("terminal");
       setStatusLine("已粘贴剪贴板内容到终端");
       terminalRef.current?.focus();
@@ -3661,6 +3929,10 @@ function App() {
 
   function closeTreeContextMenu() {
     setTreeContextMenu(null);
+  }
+
+  function closeTerminalTabContextMenu() {
+    setTerminalTabContextMenu(null);
   }
 
   function closeFileActionDialog() {
@@ -3874,6 +4146,24 @@ function App() {
     });
   }
 
+  function openTerminalTabContextMenu(event: ReactMouseEvent<HTMLElement>, terminalId: string) {
+    event.preventDefault();
+    event.stopPropagation();
+    setIsHistoryMenuOpen(false);
+    setTreeContextMenu(null);
+
+    const menuWidth = 220;
+    const menuHeight = 228;
+    const x = Math.max(16, Math.min(event.clientX, window.innerWidth - menuWidth - 16));
+    const y = Math.max(16, Math.min(event.clientY, window.innerHeight - menuHeight - 16));
+
+    setTerminalTabContextMenu({
+      x,
+      y,
+      terminalId
+    });
+  }
+
   async function copyTextToClipboard(text: string, label: string) {
     try {
       await navigator.clipboard.writeText(text);
@@ -3892,6 +4182,7 @@ function App() {
 
     try {
       await sendToActiveTerminal(buildCdCommand(targetDir));
+      setTerminalDirectory(activeTerminalIdRef.current, targetDir);
       syncCommandDraft("");
       setActiveWorkspace("terminal");
       setStatusLine(`已发送切换目录命令: ${targetDir}`);
@@ -4040,6 +4331,21 @@ function App() {
 
   const connectionHostText = connection?.host ?? "未连接";
   const activeTerminalTab = terminalTabs.find((item) => item.id === activeTerminalId) ?? null;
+  const terminalContextTargetTab = terminalTabContextMenu
+    ? terminalTabs.find((item) => item.id === terminalTabContextMenu.terminalId) ?? null
+    : null;
+  const terminalContextTargetIndex = terminalContextTargetTab
+    ? terminalTabs.findIndex((item) => item.id === terminalContextTargetTab.id)
+    : -1;
+  const terminalContextLeftIds =
+    terminalContextTargetIndex > 0 ? terminalTabs.slice(0, terminalContextTargetIndex).map((item) => item.id) : [];
+  const terminalContextRightIds =
+    terminalContextTargetIndex >= 0 && terminalContextTargetIndex < terminalTabs.length - 1
+      ? terminalTabs.slice(terminalContextTargetIndex + 1).map((item) => item.id)
+      : [];
+  const terminalContextOtherIds = terminalContextTargetTab
+    ? terminalTabs.filter((item) => item.id !== terminalContextTargetTab.id).map((item) => item.id)
+    : [];
   const terminalShellTitle = activeTerminalTab?.title ?? "终端";
   const terminalShellSubtitle = connection ? `${connection.name} · ${statusLine}` : statusLine;
   const currentWorkspaceTitle =
@@ -4217,7 +4523,7 @@ function App() {
   const sidebarSummaryLabel = connection ? `${currentDirCount} 个目录 · ${currentFileCount} 个文件` : "未连接";
   const previewEditorLanguage = resolveEditorLanguage(preview?.language);
   const searchCounterLabel = searchResultCount ? `${searchActiveIndex + 1} / ${searchResultCount}` : "0 / 0";
-  const currentDirectoryPath = currentPath || connection?.homePath || "/";
+  const currentDirectoryPath = activeTerminalCwd || connection?.homePath || "/";
   const scopedCommandHistory = useMemo(
     () => commandHistory.filter((item) => item.cwd === currentDirectoryPath),
     [commandHistory, currentDirectoryPath]
@@ -4643,7 +4949,11 @@ function App() {
                             className={`terminal-session-tab ${tab.id === activeTerminalId ? "active" : ""} ${
                               tab.hasUnreadOutput && tab.id !== activeTerminalId ? "has-unread" : ""
                             }`}
+                            onContextMenu={(event) => {
+                              openTerminalTabContextMenu(event, tab.id);
+                            }}
                             onClick={() => {
+                              closeTerminalTabContextMenu();
                               setActiveTerminalId(tab.id);
                               setTerminalTabs((previous) =>
                                 previous.map((item) =>
@@ -4654,7 +4964,7 @@ function App() {
                             }}
                           >
                             <span className="terminal-session-label">{tab.title}</span>
-                            {terminalTabs.length > 1 ? (
+                            {connection ? (
                               <span
                                 className="terminal-session-close"
                                 role="button"
@@ -4706,7 +5016,7 @@ function App() {
                     </div>
                     <div className="terminal-shell-side">
                       <span className="terminal-shell-meta-pill">{terminalStatusLabel}</span>
-                      <span className="terminal-shell-meta-path">{connection?.homePath ?? "/"}</span>
+                      <span className="terminal-shell-meta-path">{activeTerminalCwd || connection?.homePath || "/"}</span>
                     </div>
                   </div>
                   <div className="terminal-host" ref={terminalHostRef} />
@@ -4794,6 +5104,31 @@ function App() {
           </section>
         </main>
       </div>
+
+      {terminalTabContextMenu && terminalContextTargetTab ? (
+        <TerminalTabContextMenu
+          menuRef={terminalTabContextMenuRef}
+          menu={terminalTabContextMenu}
+          title={terminalContextTargetTab.title}
+          subtitle={`${terminalTabs.length} 个终端窗口`}
+          canCloseCurrent={Boolean(connection)}
+          canCloseLeft={terminalContextLeftIds.length > 0}
+          canCloseRight={terminalContextRightIds.length > 0}
+          canCloseOthers={terminalContextOtherIds.length > 0}
+          onCloseCurrent={() => {
+            void closeTerminalTab(terminalContextTargetTab.id);
+          }}
+          onCloseLeft={() => {
+            void closeMultipleTerminalTabs(terminalContextLeftIds, `已关闭左侧 ${terminalContextLeftIds.length} 个终端`);
+          }}
+          onCloseRight={() => {
+            void closeMultipleTerminalTabs(terminalContextRightIds, `已关闭右侧 ${terminalContextRightIds.length} 个终端`);
+          }}
+          onCloseOthers={() => {
+            void closeMultipleTerminalTabs(terminalContextOtherIds, `已关闭其他 ${terminalContextOtherIds.length} 个终端`);
+          }}
+        />
+      ) : null}
 
       {treeContextMenu ? (
         <TreeContextMenu

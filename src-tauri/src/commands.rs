@@ -426,13 +426,12 @@ fn connect_ssh_blocking(
             ConnectionProgress {
                 stage: "terminal".into(),
                 message: "正在启动交互终端...".into(),
-                detail: Some("PTY 建好后就能开始收发命令。".into()),
+                detail: Some("前端马上会创建首个终端标签，避免连接刚完成时会话抢跑。".into()),
                 current_step: 5,
                 total_steps: CONNECT_TOTAL_STEPS,
                 is_error: false,
             },
         );
-        register_terminal_session(&app, session, request.cols, request.rows)?;
 
         emit_connection_progress(
             &app,
